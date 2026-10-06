@@ -1,0 +1,94 @@
+
+
+import numpy as np
+from FITNESS_GUIDE_CORE import FitnessGuideMixin
+from MULTISTRATEGY_CORE import MultiStrategyMixin
+from POA import POA
+
+
+class MFPOA(FitnessGuideMixin, MultiStrategyMixin, POA):
+    name = "MFPOA"
+
+    def __init__(self, pop_size=30, max_iter=200, h_enabled=True,
+                 h_reference_dim=6, h_unique_warmup=True,
+                 h_uniform_crossover=True, **kwargs):
+        for name, value in (("h_enabled", h_enabled),
+                            ("h_unique_warmup", h_unique_warmup),
+                            ("h_uniform_crossover", h_uniform_crossover)):
+            if not isinstance(value, (bool, np.bool_)):
+                raise ValueError(name + " must be boolean")
+        if (isinstance(h_reference_dim, (bool, np.bool_))
+                or not isinstance(h_reference_dim, (int, np.integer))
+                or h_reference_dim < 2):
+            raise ValueError("h_reference_dim must be an integer >= 2")
+        super().__init__(pop_size=pop_size, max_iter=max_iter, **kwargs)
+        self.h_enabled = bool(h_enabled)
+        self.h_reference_dim = int(h_reference_dim)
+        self.h_unique_warmup = bool(h_unique_warmup)
+        self.h_uniform_crossover = bool(h_uniform_crossover)
+
+    def _reset_variant(self, dim):
+        super()._reset_variant(dim)
+        self.diagnostics_history = []
+        self.warmup_survival_history = []
+        self._h_uniform_rates = []
+
+    def _h_active(self, dim):
+        # Disabling M/F still returns exactly to its corresponding ablation.
+        return (self.h_enabled and dim > self.h_reference_dim
+                and self.m_enabled and self.f_enabled)
+
+    def _select_warmup_survivors(self, population, cost, n):
+        dim = population.shape[1]
+        order = np.argsort(cost, kind="stable")
+        enabled = self._h_active(dim) and self.h_unique_warmup
+        original = order[:n]
+        if enabled:
+            # Work on the sorted pool: each first index is the best occurrence.
+            # Re-sort returned indices to undo np.unique's coordinate ordering.
+            _, first = np.unique(population[order], axis=0, return_index=True)
+            distinct = order[np.sort(first)]
+            keep = distinct[:n]
+            if len(keep) < n:
+                # No random refill and no extra evaluation. This case is possible
+                # only when the merged pool already has fewer than n positions.
+                remaining = order[~np.isin(order, keep)]
+                keep = np.concatenate((keep, remaining[:n-len(keep)]))
+            keep = keep[np.argsort(cost[keep], kind="stable")]
+        else:
+            keep = super()._select_warmup_survivors(population, cost, n)
+        self.warmup_survival_history.append({
+            "iteration": self._iteration, "dimension": dim,
+            "unique_priority_enabled": enabled, "pool_size": len(cost),
+            "pool_unique_positions": len(np.unique(population, axis=0)),
+            "original_selection_unique_positions": len(np.unique(population[original], axis=0)),
+            "selected_unique_positions": len(np.unique(population[keep], axis=0)),
+            "survivors": len(keep), "additional_objective_calls": 0})
+        return keep
+
+    def _m_crossover_rate(self, pcr, dim, uniform_branch):
+        rate = super()._m_crossover_rate(pcr, dim, uniform_branch)
+        if uniform_branch and self._h_active(dim) and self.h_uniform_crossover:
+            rate *= (self.h_reference_dim - 1) / (dim - 1)
+        if uniform_branch:
+            self._h_uniform_rates.append((float(pcr), float(rate)))
+        return rate
+
+    def _observe_population(self, population, cost, lb, ub):
+        n, dim = population.shape
+        normalized = (population-lb)/(ub-lb)
+        rates = np.asarray(self._h_uniform_rates, dtype=float)
+        self._h_uniform_rates.clear()
+        self.diagnostics_history.append({
+            "iteration": self._iteration, "phase": self._phase,
+            "fes": self._fes, "dimension": dim, "h_active": self._h_active(dim),
+            "unique_positions": len(np.unique(population, axis=0)),
+            "population": n,
+            "normalized_rms_spread": float(np.sqrt(np.mean(np.var(normalized, axis=0)))),
+            "boundary_coordinate_fraction": float(np.mean((population == lb)|(population == ub))),
+            "uniform_attempts_since_observation": len(rates),
+            "mean_original_uniform_pcr": float(rates[:,0].mean()) if len(rates) else "",
+            "mean_effective_uniform_pcr": float(rates[:,1].mean()) if len(rates) else "",
+            "expected_uniform_crossed_coordinates": float(1+(dim-1)*rates[:,1].mean()) if len(rates) else "",
+            "population_best_f": float(np.min(cost))})
+
