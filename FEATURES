@@ -1,0 +1,190 @@
+
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+RAW_COLUMNS = ["Date", "Open", "High", "Low", "Close", "Volume"]
+INDICATORS = [
+    "Macd_diff", "Macd_dea", "Macd",  
+    "BOLL_UPPER", "BOLL_MID", "BOLL_LOWER",
+    "KDJ_K", "KDJ_D", "KDJ_J",
+    "RSI_6", "RSI_12", "RSI_24",
+    "TEMA5", "MA5", "MA10", "EMA20", "EMA26",
+]
+
+
+def wilder_average(series: pd.Series, period: int) -> pd.Series:
+
+    data = series.to_numpy(dtype=float)
+    result = np.full(len(data), np.nan, dtype=float)
+    first = np.flatnonzero(np.isfinite(data))
+    if len(first) < period:
+        return pd.Series(result, index=series.index)
+    start = int(first[0])
+    seed_end = start + period
+    if seed_end > len(data) or not np.isfinite(data[start:seed_end]).all():
+        raise ValueError("Wilder 平滑的有效值之间有缺口，请先检查清洗结果")
+    result[seed_end - 1] = data[start:seed_end].mean()
+    for i in range(seed_end, len(data)):
+        if np.isfinite(data[i]):
+            result[i] = (result[i - 1] * (period - 1) + data[i]) / period
+    return pd.Series(result, index=series.index)
+
+
+def clean_raw(frame: pd.DataFrame) -> pd.DataFrame:
+
+    rename = {name.lower(): name for name in RAW_COLUMNS}
+    frame = frame.rename(columns={c: rename.get(str(c).strip().lower(), c)
+                                  for c in frame.columns}).copy()
+    missing = sorted(set(RAW_COLUMNS) - set(frame.columns))
+    if missing:
+        raise ValueError(f"输入缺少必要列：{missing}；实际列：{list(frame.columns)}")
+
+    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+    invalid_dates = int(frame["Date"].isna().sum())
+    frame = frame.dropna(subset=["Date"])
+    duplicate_dates = int(frame.duplicated("Date", keep="last").sum())
+    frame = frame.drop_duplicates("Date", keep="last").sort_values("Date")
+    frame = frame.reset_index(drop=True)
+    if frame.empty:
+        raise ValueError("没有有效交易日期")
+
+    numeric = RAW_COLUMNS[1:]
+    for name in numeric:
+        frame[name] = pd.to_numeric(frame[name], errors="coerce")
+    for name in ["Open", "High", "Low", "Close"]:
+        frame.loc[frame[name] <= 0, name] = np.nan
+    frame.loc[frame["Volume"] < 0, "Volume"] = np.nan
+
+    # 四价关系不成立的整行记为缺失，再统一插值。
+    inconsistent = (
+        (frame["High"] < frame[["Open", "Close", "Low"]].max(axis=1))
+        | (frame["Low"] > frame[["Open", "Close", "High"]].min(axis=1))
+    )
+    inconsistent_count = int(inconsistent.sum())
+    frame.loc[inconsistent, ["Open", "High", "Low", "Close"]] = np.nan
+    counts = frame[numeric].isna().sum().to_dict()
+    all_missing = [name for name in numeric if frame[name].notna().sum() == 0]
+    if all_missing:
+        raise ValueError(f"必要列全部缺失，无法插值：{all_missing}")
+
+
+    frame[numeric] = frame[numeric].interpolate(method="linear", limit_area="inside")
+    frame[numeric] = frame[numeric].ffill().bfill()
+    if frame[numeric].isna().any().any():
+        raise ValueError("清洗后仍有空值，请检查输入")
+    invalid_after = (
+        (frame["High"] < frame[["Open", "Close", "Low"]].max(axis=1))
+        | (frame["Low"] > frame[["Open", "Close", "High"]].min(axis=1))
+    )
+    if invalid_after.any():
+        bad_dates = frame.loc[invalid_after, "Date"].dt.strftime("%Y-%m-%d").head(5).tolist()
+        raise ValueError(f"插值后 OHLC 关系不成立，需人工核查日期：{bad_dates}")
+    print(f"无效日期：{invalid_dates}；重复日期：{duplicate_dates}；异常 OHLC 行：{inconsistent_count}")
+    print(f"插值/端点填充前各列缺失数：{counts}")
+    return frame[RAW_COLUMNS]
+
+
+def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
+
+    out = frame.copy()
+    high, low, close = out["High"], out["Low"], out["Close"]
+
+    # MACD(12, 26, 9)。Macd 取国内常见的两倍柱状值定义。
+    ema12 = close.ewm(span=12, adjust=False, min_periods=12).mean()
+    ema26 = close.ewm(span=26, adjust=False, min_periods=26).mean()
+    diff = ema12 - ema26
+    dea = diff.ewm(span=9, adjust=False, min_periods=9).mean()
+    out["Macd_diff"] = diff
+    out["Macd_dea"] = dea
+    out["Macd"] = 2.0 * (diff - dea)
+
+    # BOLL(20, 2)：20 日中轨，标准差使用总体标准差 ddof=0。
+    boll_mid = close.rolling(window=20, min_periods=20).mean()
+    boll_std = close.rolling(window=20, min_periods=20).std(ddof=0)
+    out["BOLL_UPPER"] = boll_mid + 2.0 * boll_std
+    out["BOLL_MID"] = boll_mid
+    out["BOLL_LOWER"] = boll_mid - 2.0 * boll_std
+
+    # KDJ(9)：RSV=(Close-最低价)/(最高价-最低价)*100。
+    # K、D 的递推初值均为 50；当 9 日高低价相等时 RSV 定为 50。
+    lowest_9 = low.rolling(window=9, min_periods=9).min()
+    highest_9 = high.rolling(window=9, min_periods=9).max()
+    price_range = highest_9 - lowest_9
+    rsv = (100.0 * (close - lowest_9) / price_range.replace(0, np.nan))
+    rsv = rsv.mask(price_range.eq(0), 50.0)
+    k_values = np.full(len(out), np.nan, dtype=float)
+    d_values = np.full(len(out), np.nan, dtype=float)
+    last_k = last_d = 50.0
+    for i, value in enumerate(rsv.to_numpy(dtype=float)):
+        if np.isfinite(value):
+            last_k = (2.0 * last_k + value) / 3.0
+            last_d = (2.0 * last_d + last_k) / 3.0
+            k_values[i], d_values[i] = last_k, last_d
+    out["KDJ_K"] = k_values
+    out["KDJ_D"] = d_values
+    out["KDJ_J"] = 3.0 * out["KDJ_K"] - 2.0 * out["KDJ_D"]
+
+    # RSI(6, 12, 24)：Wilder 平滑，完全持平时定义为 50。
+    delta = close.diff()
+    for period in (6, 12, 24):
+        gains = wilder_average(delta.clip(lower=0), period)
+        losses = wilder_average((-delta).clip(lower=0), period)
+        rs = gains / losses.replace(0, np.nan)
+        rsi = 100.0 - 100.0 / (1.0 + rs)
+        rsi = rsi.mask(losses.eq(0) & gains.gt(0), 100.0)
+        rsi = rsi.mask(gains.eq(0) & losses.gt(0), 0.0)
+        out[f"RSI_{period}"] = rsi.mask(gains.eq(0) & losses.eq(0), 50.0)
+
+    # TEMA5 = 3*EMA5 - 3*EMA(EMA5) + EMA(EMA(EMA5))。
+    ema5_1 = close.ewm(span=5, adjust=False, min_periods=5).mean()
+    ema5_2 = ema5_1.ewm(span=5, adjust=False, min_periods=5).mean()
+    ema5_3 = ema5_2.ewm(span=5, adjust=False, min_periods=5).mean()
+    out["TEMA5"] = 3.0 * ema5_1 - 3.0 * ema5_2 + ema5_3
+    out["MA5"] = close.rolling(window=5, min_periods=5).mean()
+    out["MA10"] = close.rolling(window=10, min_periods=10).mean()
+    out["EMA20"] = close.ewm(span=20, adjust=False, min_periods=20).mean()
+    out["EMA26"] = ema26
+
+    # PreClose 来自已清洗的上一交易日收盘点位，固定作为第二列。
+    out.insert(1, "PreClose", close.shift(1))
+    warmup = out[INDICATORS + ["PreClose"]].isna().any(axis=1)
+    print(f"指标预热期移除 {int(warmup.sum())} 行；不以未来价格填充指标预热缺失")
+    out = out.loc[~warmup, ["Date", "PreClose", "Open", "High", "Low",
+                              "Close", "Volume", *INDICATORS]].reset_index(drop=True)
+    if out.empty:
+        raise ValueError("有效历史长度不足以计算全部 17 项指标")
+    if not np.isfinite(out.drop(columns="Date").to_numpy(dtype=float)).all():
+        raise ValueError("结果仍有非有限值，请检查行情或指标计算")
+    return out
+
+
+def main() -> None:
+    here = Path(__file__).resolve().parent
+    default_input = here / "SSEcsv"
+    if not default_input.exists() and (here / "SSEcsv.csv").exists():
+        default_input = here / "SSEcsv.csv"
+    parser = argparse.ArgumentParser(description="SSE 日行情清洗及 17 项技术指标构造")
+    parser.add_argument("--input", type=Path, default=default_input)
+    parser.add_argument("--output", type=Path, default=here / "SSE_清洗及17项指标.csv")
+    args = parser.parse_args()
+    raw = pd.read_csv(args.input, encoding="utf-8-sig", low_memory=False)
+    cleaned = clean_raw(raw)
+    result = add_indicators(cleaned)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+
+    result = result.astype({c: "float64" for c in result.columns if c != "Date"})
+    result.to_csv(args.output, index=False, encoding="utf-8-sig",
+                  date_format="%Y-%m-%d", float_format="%.2f")
+    print(f"保存：{args.output}；交易日数：{len(result)}；列数：{len(result.columns)}")
+    print("列名：", result.columns.tolist())
+
+
+if __name__ == "__main__":
+    main()
