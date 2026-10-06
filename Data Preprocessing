@@ -1,0 +1,245 @@
+
+
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from joblib import dump
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+
+
+ROOT = Path(__file__).resolve().parent
+INPUT_CSV = ROOT / 
+SAVE_DIR = ROOT / "npy_data"  # 与 Performer(1).py 读取的目录名一致
+
+DATE_COL = "Date"
+TARGET_COL = "Close"
+WINDOW_SIZE = 20  
+HORIZON = 1          
+TRAIN_RATIO = 0.70
+VAL_RATIO = 0.15
+TEST_RATIO = 0.15
+
+
+EXCLUDE_FEATURES: tuple[str, ...] = ()
+
+
+X_FEATURE_RANGE = (0.0, 1.0)
+VOLATILITY_WINDOW = 20     
+VOLATILITY_QUANTILES = (1 / 3, 2 / 3)  
+ARRAY_DTYPE = np.float32
+
+
+def read_input() -> tuple[pd.DataFrame, list[str]]:
+    if WINDOW_SIZE < 1 or HORIZON < 1 or VOLATILITY_WINDOW < 2:
+        raise ValueError("WINDOW_SIZE/HORIZON 必须为正，VOLATILITY_WINDOW 至少为 2")
+    if not np.isclose(TRAIN_RATIO + VAL_RATIO + TEST_RATIO, 1.0):
+        raise ValueError("训练/验证/测试比例之和必须为 1")
+    if min(TRAIN_RATIO, VAL_RATIO, TEST_RATIO) <= 0:
+        raise ValueError("三个数据集的比例均须大于 0")
+
+    frame = pd.read_csv(INPUT_CSV, encoding="utf-8-sig", low_memory=False)
+    if DATE_COL not in frame or TARGET_COL not in frame:
+        raise ValueError(f"源 CSV 必须包含 {DATE_COL!r} 与 {TARGET_COL!r}")
+    if len(set(frame.columns)) != len(frame.columns):
+        raise ValueError("源 CSV 有重复列名，需先处理")
+    frame[DATE_COL] = pd.to_datetime(frame[DATE_COL], errors="raise")
+    if frame[DATE_COL].isna().any() or frame[DATE_COL].duplicated().any():
+        raise ValueError("存在无效或重复日期，需先检查源 CSV")
+    frame = frame.sort_values(DATE_COL).reset_index(drop=True)
+
+    unknown = set(EXCLUDE_FEATURES) - set(frame.columns)
+    if unknown:
+        raise ValueError(f"EXCLUDE_FEATURES 包含不存在的列：{sorted(unknown)}")
+    feature_cols = [col for col in frame.columns
+                    if col not in (DATE_COL, TARGET_COL) and col not in EXCLUDE_FEATURES]
+    if not feature_cols:
+        raise ValueError("排除 Close 后没有可用的输入特征")
+
+    for col in set(feature_cols + [TARGET_COL]):
+        frame[col] = pd.to_numeric(frame[col], errors="raise")
+    numeric = frame[feature_cols + [TARGET_COL]].to_numpy(dtype=np.float64)
+    if not np.isfinite(numeric).all():
+        raise ValueError("特征或标签出现 NaN/无穷大：先核对上游清洗过程")
+    if (frame[TARGET_COL] <= 0).any():
+        raise ValueError("Close 必须为正的指数点位")
+    return frame, feature_cols
+
+
+def split_targets(n_rows: int) -> dict[str, np.ndarray]:
+
+    targets = np.arange(WINDOW_SIZE + HORIZON - 1, n_rows, dtype=np.int64)
+    n = len(targets)
+    n_train = int(np.floor(n * TRAIN_RATIO))
+    n_val = int(np.floor(n * VAL_RATIO))
+    n_test = n - n_train - n_val
+    if min(n_train, n_val, n_test) < 1:
+        raise ValueError("有效样本数不足以划分三个非空数据集")
+    groups = {
+        "train": targets[:n_train],
+        "val": targets[n_train:n_train + n_val],
+        "test": targets[n_train + n_val:],
+    }
+    assert all(len(part) > 0 for part in groups.values())
+    assert np.array_equal(np.concatenate(list(groups.values())), targets)
+    return groups
+
+
+def make_samples(
+    scaled_features: np.ndarray,
+    scaled_target: np.ndarray,
+    target_rows: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+
+    ends = target_rows - HORIZON
+    starts = ends - WINDOW_SIZE + 1
+    if starts.min() < 0 or not np.all(ends < target_rows):
+        raise AssertionError("时间索引错误：窗口含预测日或越界")
+    X = np.empty((len(target_rows), WINDOW_SIZE, scaled_features.shape[1]),
+                 dtype=ARRAY_DTYPE)
+    for sample_number, (start, end) in enumerate(zip(starts, ends)):
+        X[sample_number] = scaled_features[start:end + 1]
+    y = scaled_target[target_rows].astype(ARRAY_DTYPE, copy=False)
+    if not np.isfinite(X).all() or not np.isfinite(y).all():
+        raise ValueError("缩放后产生非有限数值")
+    return X, y, starts, ends
+
+
+def make_metadata(
+    frame: pd.DataFrame,
+    target_rows: np.ndarray,
+    starts: np.ndarray,
+    ends: np.ndarray,
+    volatility: pd.Series,
+    low_threshold: float | None,
+    high_threshold: float | None,
+    split: str,
+) -> pd.DataFrame:
+    date = frame[DATE_COL]
+    close = frame[TARGET_COL].to_numpy(dtype=np.float64)
+    actual = close[target_rows]
+    last_close = close[ends]
+    known_vol = volatility.iloc[ends].to_numpy(dtype=np.float64)
+    if low_threshold is None or high_threshold is None:
+        regime = np.full(len(target_rows), "unavailable", dtype=object)
+    else:
+        regime = np.where(np.isnan(known_vol), "warmup",
+                          np.where(known_vol <= low_threshold, "low",
+                                   np.where(known_vol <= high_threshold,
+                                            "medium", "high")))
+
+    target_date = date.iloc[target_rows].reset_index(drop=True)
+    asof_date = date.iloc[ends].reset_index(drop=True)
+    return pd.DataFrame({
+        "sample_id": np.arange(len(target_rows))
+        "split": split,
+        "source_target_row": target_rows,
+        "window_start_date": date.iloc[starts].dt.strftime("%Y-%m-%d").to_numpy(),
+        "asof_date": asof_date.dt.strftime("%Y-%m-%d"),
+        "target_date": target_date.dt.strftime("%Y-%m-%d"),
+        "last_observed_close": last_close,
+        "target_close": actual,  
+        "naive_pred_close": last_close,  
+        "naive_abs_error": np.abs(actual - last_close),
+        "realized_return_pct": 100.0 * (actual / last_close - 1.0),
+        "asof_volatility20_pct": known_vol,
+        "volatility_regime": regime,
+        "target_year": target_date.dt.year,
+        "target_month": target_date.dt.month,
+        "target_weekday": target_date.dt.day_name(),
+        "calendar_gap_days": (target_date - asof_date).dt.days,
+    })
+
+
+def main() -> None:
+    frame, features = read_input()
+    groups = split_targets(len(frame))
+    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+    train_last_feature_row = int(groups["train"][-1] - HORIZON)
+    scaler_X = MinMaxScaler(feature_range=X_FEATURE_RANGE)
+    scaler_X.fit(frame.loc[:train_last_feature_row, features])
+    scaler_y = StandardScaler()
+    scaler_y.fit(frame.loc[groups["train"], [TARGET_COL]])
+    all_X = scaler_X.transform(frame[features]).astype(ARRAY_DTYPE)
+    all_y = scaler_y.transform(frame[[TARGET_COL]]).reshape(-1)
+
+
+    returns_pct = frame[TARGET_COL].pct_change() * 100.0
+    vol = returns_pct.rolling(VOLATILITY_WINDOW,
+                              min_periods=VOLATILITY_WINDOW).std(ddof=0)
+    train_ends = groups["train"] - HORIZON
+    train_vol = vol.iloc[train_ends].dropna()
+    thresholds = (train_vol.quantile(list(VOLATILITY_QUANTILES)).tolist()
+                  if len(train_vol) else [None, None])
+    low_threshold, high_threshold = thresholds
+
+    rows = []
+    for split, targets in groups.items():
+        X, y, starts, ends = make_samples(all_X, all_y, targets)
+        np.save(SAVE_DIR / f"X_{split}.npy", X, allow_pickle=False)
+        np.save(SAVE_DIR / f"y_{split}.npy", y, allow_pickle=False)
+        metadata = make_metadata(frame, targets, starts, ends, vol,
+                                 low_threshold, high_threshold, split)
+        metadata.to_csv(SAVE_DIR / f"sample_index_{split}.csv", index=False,
+                        encoding="utf-8-sig", float_format="%.6f")
+        assert len(X) == len(y) == len(metadata)
+        rows.append({
+            "split": split,
+            "samples": len(X),
+            "target_start": metadata["target_date"].iloc[0],
+            "target_end": metadata["target_date"].iloc[-1],
+            "X_shape": str(X.shape),
+            "y_shape": str(y.shape),
+        })
+
+    feature_array = np.asarray(features, dtype=str)
+    for stem in ("feature_names", "feature_cols"):
+        np.save(SAVE_DIR / f"{stem}.npy", feature_array, allow_pickle=False)
+        pd.DataFrame({"feature": features}).to_csv(
+            SAVE_DIR / f"{stem}.csv", index=False, encoding="utf-8-sig")
+    dump(scaler_X, SAVE_DIR / "scaler_X.pkl")
+    dump(scaler_y, SAVE_DIR / "scaler_y.pkl")
+    summary = pd.DataFrame(rows)
+    summary.to_csv(SAVE_DIR / "split_summary.csv", index=False,
+                   encoding="utf-8-sig")
+
+    manifest = {
+        "source_file": INPUT_CSV.name,
+        "source_sha256": hashlib.sha256(INPUT_CSV.read_bytes()).hexdigest(),
+        "date_column": DATE_COL,
+        "target_column": TARGET_COL,
+        "target_in_input_features": False,
+        "features": features,
+        "feature_count": len(features),
+        "window_size_trading_days": WINDOW_SIZE,
+        "horizon_trading_days": HORIZON,
+        "requested_split_ratio": {"train": TRAIN_RATIO, "val": VAL_RATIO,
+                                  "test": TEST_RATIO},
+        "actual_sample_count": {r["split"]: r["samples"] for r in rows},
+        "input_scaler": "MinMaxScaler; fit on training input rows only",
+        "target_scaler": "StandardScaler; fit on training target rows only",
+        "array_dtype": str(np.dtype(ARRAY_DTYPE)),
+        "volatility_window": VOLATILITY_WINDOW,
+        "volatility_cutoffs_train_only_pct": {
+            "low": low_threshold, "high": high_threshold},
+        "metadata_join": "按 split 的 sample_id/行顺序，与预测 CSV 拼接",
+        "warning": "上游全样本双向插值可能含未来信息，本脚本不能逆转该影响",
+    }
+    (SAVE_DIR / "preprocessing_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print("========== 数据处理完成 ==========")
+    print(f"输入：截至 t 的 {WINDOW_SIZE} 个交易日，不含 {TARGET_COL}；标签：t+{HORIZON} 的 {TARGET_COL}")
+    print(f"特征维度：{len(features)}；输出目录：{SAVE_DIR}")
+    print(summary.to_string(index=False))
+    print("scaler_X/scaler_y 均只在训练期拟合；样本元数据可用于逐年/波动分组误差分析")
+
+
+if __name__ == "__main__":
+    main()
