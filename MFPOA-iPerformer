@@ -1,1 +1,2752 @@
 
+import os
+import json
+import math
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_absolute_percentage_error
+from joblib import load
+
+
+SEED = 42
+
+BATCH_SIZE = 64
+EPOCHS = 80
+PATIENCE = 15
+LR = 0.001
+WEIGHT_DECAY = 1e-5
+GRAD_CLIP = 1.0
+
+
+SCHEDULER_FACTOR = 0.5
+SCHEDULER_PATIENCE = 5
+MIN_LR = 1e-6
+
+
+D_MODEL = 64
+NUM_LAYERS = 3
+N_HEADS = 4
+
+
+NB_FEATURES = 128
+
+DIM_FEEDFORWARD = 128
+DROPOUT = 0.1
+
+
+USE_TIME_POS_EMBED = True
+
+
+REDRAW_PROJECTION = False
+
+
+LOCAL_KERNEL_SIZE = 3
+
+OUT_DIR = "train_results/MFPOA-iPerformer"
+FIG_DIR = f"{OUT_DIR}/figures"
+RES_DIR = f"{OUT_DIR}/results"
+
+
+def seed_everything(seed=42):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+seed_everything(SEED)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"当前使用设备: {device}")
+
+os.makedirs(FIG_DIR, exist_ok=True)
+os.makedirs(RES_DIR, exist_ok=True)
+
+
+X_train = np.load("npy_data/X_train.npy")
+y_train = np.load("npy_data/y_train.npy")
+
+X_val = np.load("npy_data/X_val.npy")
+y_val = np.load("npy_data/y_val.npy")
+
+X_test = np.load("npy_data/X_test.npy")
+y_test = np.load("npy_data/y_test.npy")
+
+scaler_y = load("npy_data/scaler_y.pkl")
+
+
+if any(a.ndim != 3 for a in (X_train, X_val, X_test)):
+    raise ValueError("X_train/X_val/X_test 必须是 [样本数, 时间步, 特征数] 三维数组")
+if X_train.shape[1] < 1 or X_train.shape[2] < 1:
+    raise ValueError("窗口长度和特征数必须为正")
+if X_val.shape[1:] != X_train.shape[1:] or X_test.shape[1:] != X_train.shape[1:]:
+    raise ValueError("验证/测试集的窗口长度和特征数必须与训练集相同")
+for split, X, y in (("train", X_train, y_train), ("val", X_val, y_val), ("test", X_test, y_test)):
+    if len(X) == 0 or y.size != len(X) or not np.isfinite(X).all() or not np.isfinite(y).all():
+        raise ValueError(f"{split} 集为空、X/y 样本数不符或含非有限数值")
+if not hasattr(scaler_y, "inverse_transform") or not hasattr(scaler_y, "scale_"):
+    raise ValueError("scaler_y.pkl 必须是已拟合的目标列标准化器")
+
+print("========== 数据形状 ==========")
+print(f"X_train: {X_train.shape}, y_train: {y_train.shape}")
+print(f"X_val:   {X_val.shape}, y_val:   {y_val.shape}")
+print(f"X_test:  {X_test.shape}, y_test:  {y_test.shape}")
+
+SEQ_LEN = X_train.shape[1]
+INPUT_DIM = X_train.shape[2]
+
+torch_X_train = torch.tensor(X_train, dtype=torch.float32)
+torch_y_train = torch.tensor(y_train, dtype=torch.float32).reshape(-1, 1)
+
+torch_X_val = torch.tensor(X_val, dtype=torch.float32)
+torch_y_val = torch.tensor(y_val, dtype=torch.float32).reshape(-1, 1)
+
+torch_X_test = torch.tensor(X_test, dtype=torch.float32)
+torch_y_test = torch.tensor(y_test, dtype=torch.float32).reshape(-1, 1)
+
+
+feature_names = None
+possible_feature_files = [
+    "npy_data/feature_names.npy",
+    "npy_data/feature_cols.npy",
+    "npy_data/feature_names.csv",
+    "npy_data/feature_cols.csv"
+]
+
+for f in possible_feature_files:
+    if os.path.exists(f):
+        try:
+            if f.endswith(".npy"):
+                feature_names = list(np.load(f, allow_pickle=True))
+            elif f.endswith(".csv"):
+                tmp = pd.read_csv(f)
+                if tmp.shape[1] == 1:
+                    feature_names = tmp.iloc[:, 0].astype(str).tolist()
+                else:
+                    feature_names = tmp.columns.astype(str).tolist()
+
+            print(f"已读取特征名文件: {f}")
+            break
+
+        except Exception as e:
+            print(f"特征名文件读取失败: {f}, 原因: {e}")
+
+if feature_names is None or len(feature_names) != INPUT_DIM:
+    raise ValueError("特征名缺失或与 X 最后一维不一致；请先重新运行数据预处理(2).py")
+if "Close" in feature_names:
+    raise ValueError("输入特征中包含 Close；请使用新版数据预处理(2).py 重新生成 npy_data")
+
+feature_names = [str(name) for name in feature_names]
+if len(feature_names) != len(set(feature_names)):
+    raise ValueError("特征名存在重复，无法正确输出特征分析结果")
+if LOCAL_KERNEL_SIZE < 3 or LOCAL_KERNEL_SIZE % 2 != 1:
+    raise ValueError("LOCAL_KERNEL_SIZE 必须为大于等于 3 的奇数")
+
+
+def orthogonal_matrix_chunk(cols, device=None):
+
+
+    unstructured_block = torch.randn((cols, cols), device=device)
+    q, r = torch.linalg.qr(unstructured_block, mode="reduced")
+
+
+    d = torch.diag(r)
+    ph = torch.sign(d)
+    ph[ph == 0] = 1.0
+    q = q * ph.unsqueeze(0)
+
+    return q.t()
+
+
+def gaussian_orthogonal_random_matrix(
+    nb_rows,
+    nb_columns,
+    nb_heads,
+    scaling=0,
+    device=None
+):
+
+
+    final_matrices = []
+
+    for _ in range(nb_heads):
+        blocks = []
+
+        nb_full_blocks = nb_rows // nb_columns
+        remaining_rows = nb_rows % nb_columns
+
+        for _ in range(nb_full_blocks):
+            q = orthogonal_matrix_chunk(nb_columns, device=device)
+            blocks.append(q)
+
+        if remaining_rows > 0:
+            q = orthogonal_matrix_chunk(nb_columns, device=device)
+            blocks.append(q[:remaining_rows])
+
+        final_matrix = torch.cat(blocks, dim=0)
+
+        if scaling == 0:
+
+            multiplier = torch.randn((nb_rows, nb_columns), device=device).norm(dim=1)
+        elif scaling == 1:
+
+            multiplier = math.sqrt(float(nb_columns)) * torch.ones((nb_rows,), device=device)
+        else:
+            raise ValueError("scaling must be 0 or 1")
+
+        final_matrix = final_matrix * multiplier.unsqueeze(1)
+        final_matrices.append(final_matrix)
+
+    projection_matrix = torch.stack(final_matrices, dim=0)
+    return projection_matrix
+
+
+def softmax_kernel_favor(
+    data,
+    projection_matrix,
+    is_query,
+    eps=1e-6
+):
+
+
+    B, H, N, Dh = data.shape
+
+
+    data_normalizer = Dh ** -0.25
+    data = data * data_normalizer
+
+    projection_matrix = projection_matrix.to(data.device)
+
+
+    data_dash = torch.einsum(
+        "bhnd,hmd->bhnm",
+        data,
+        projection_matrix
+    )
+
+
+    diag_data = (data ** 2).sum(dim=-1, keepdim=True) / 2.0
+    data_dash = data_dash - diag_data
+
+
+    if is_query:
+
+        max_val = torch.max(data_dash, dim=-1, keepdim=True).values
+    else:
+
+        max_val = torch.max(
+            data_dash.reshape(B, H, -1),
+            dim=-1,
+            keepdim=True
+        ).values.reshape(B, H, 1, 1)
+
+    data_dash = data_dash - max_val.detach()
+
+    ratio = projection_matrix.shape[1] ** -0.5
+    data_prime = ratio * (torch.exp(data_dash) + eps)
+
+    return data_prime
+
+
+class PerformerAttention(nn.Module):
+
+
+    def __init__(
+        self,
+        d_model=64,
+        n_heads=4,
+        nb_features=128,
+        dropout=0.1,
+        redraw_projection=False
+    ):
+        super().__init__()
+
+        assert d_model % n_heads == 0, "d_model 必须能被 n_heads 整除"
+
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.nb_features = nb_features
+        self.redraw_projection = redraw_projection
+
+        self.to_q = nn.Linear(d_model, d_model)
+        self.to_k = nn.Linear(d_model, d_model)
+        self.to_v = nn.Linear(d_model, d_model)
+
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        projection = gaussian_orthogonal_random_matrix(
+            nb_rows=nb_features,
+            nb_columns=self.head_dim,
+            nb_heads=n_heads,
+            scaling=0,
+            device=None
+        )
+
+        self.register_buffer("projection_matrix", projection)
+
+    @torch.no_grad()
+    def redraw_projection_matrix(self):
+        projection = gaussian_orthogonal_random_matrix(
+            nb_rows=self.nb_features,
+            nb_columns=self.head_dim,
+            nb_heads=self.n_heads,
+            scaling=0,
+            device=self.projection_matrix.device
+        )
+        self.projection_matrix.copy_(projection)
+
+    def forward(self, x):
+        if self.redraw_projection and self.training:
+            self.redraw_projection_matrix()
+
+        B, N, C = x.shape
+
+        q = self.to_q(x)
+        k = self.to_k(x)
+        v = self.to_v(x)
+
+        q = q.view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
+
+        q_prime = softmax_kernel_favor(
+            q,
+            self.projection_matrix,
+            is_query=True
+        )
+
+        k_prime = softmax_kernel_favor(
+            k,
+            self.projection_matrix,
+            is_query=False
+        )
+
+
+        kv = torch.einsum(
+            "bhnm,bhnd->bhmd",
+            k_prime,
+            v
+        )
+
+        k_sum = k_prime.sum(dim=2)
+
+        z = 1.0 / (
+            torch.einsum(
+                "bhnm,bhm->bhn",
+                q_prime,
+                k_sum
+            ) + 1e-6
+        )
+
+        out = torch.einsum(
+            "bhnm,bhmd,bhn->bhnd",
+            q_prime,
+            kv,
+            z
+        )
+
+        out = out.transpose(1, 2).contiguous().view(B, N, C)
+        out = self.out_proj(out)
+        out = self.dropout(out)
+
+        return out
+
+
+class PerformerEncoderLayer(nn.Module):
+
+
+    def __init__(
+        self,
+        d_model=64,
+        n_heads=4,
+        nb_features=128,
+        dim_feedforward=128,
+        dropout=0.1,
+        redraw_projection=False
+    ):
+        super().__init__()
+
+        self.norm1 = nn.LayerNorm(d_model)
+
+        self.attn = PerformerAttention(
+            d_model=d_model,
+            n_heads=n_heads,
+            nb_features=nb_features,
+            dropout=dropout,
+            redraw_projection=redraw_projection
+        )
+
+        self.norm2 = nn.LayerNorm(d_model)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class LocalGlobalPerformerEncoderLayer(PerformerEncoderLayer):
+
+    def __init__(self, *, local_kernel_size=3, **encoder_kwargs):
+        super().__init__(**encoder_kwargs)
+        if local_kernel_size < 3 or local_kernel_size % 2 != 1:
+            raise ValueError("局部卷积核必须为大于等于 3 的奇数")
+        d_model = encoder_kwargs.get("d_model", 64)
+        dropout = encoder_kwargs.get("dropout", 0.1)
+        self.local_depthwise = nn.Conv1d(
+            d_model, d_model, kernel_size=local_kernel_size,
+            padding=local_kernel_size // 2, groups=d_model)
+        self.local_activation = nn.GELU()
+        self.local_pointwise = nn.Conv1d(d_model, d_model, kernel_size=1)
+        self.local_dropout = nn.Dropout(dropout)
+
+
+        nn.init.zeros_(self.local_pointwise.weight)
+        nn.init.zeros_(self.local_pointwise.bias)
+
+    def branch_updates(self, x):
+
+        normalized = self.norm1(x)
+        global_update = self.attn(normalized)
+        local_update = self.local_depthwise(normalized.transpose(1, 2))
+        local_update = self.local_activation(local_update)
+        local_update = self.local_pointwise(local_update).transpose(1, 2)
+        local_update = self.local_dropout(local_update)
+        return global_update, local_update
+
+    def forward(self, x):
+        global_update, local_update = self.branch_updates(x)
+        x = x + global_update + local_update
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class PerformerModel(nn.Module):
+
+
+    def __init__(
+        self,
+        input_dim,
+        seq_len,
+        d_model=64,
+        num_layers=3,
+        n_heads=4,
+        nb_features=128,
+        dim_feedforward=128,
+        dropout=0.1,
+        use_time_pos_embed=True,
+        redraw_projection=False,
+        encoder_layer_cls=PerformerEncoderLayer,
+        encoder_layer_kwargs=None
+    ):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.seq_len = seq_len
+        self.d_model = d_model
+        self.use_time_pos_embed = use_time_pos_embed
+
+        self.input_embedding = nn.Linear(input_dim, d_model)
+
+        if self.use_time_pos_embed:
+            self.time_pos_embed = nn.Parameter(
+                torch.zeros(1, seq_len, d_model)
+            )
+        else:
+            self.time_pos_embed = None
+
+        layer_kwargs = {} if encoder_layer_kwargs is None else dict(encoder_layer_kwargs)
+        self.layers = nn.ModuleList([
+            encoder_layer_cls(
+                d_model=d_model,
+                n_heads=n_heads,
+                nb_features=nb_features,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                redraw_projection=redraw_projection,
+                **layer_kwargs
+            )
+            for _ in range(num_layers)
+        ])
+
+        self.norm = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, 1)
+
+    def forward(self, x, return_features=False):
+
+
+        x = self.input_embedding(x)
+
+        if self.time_pos_embed is not None:
+            x = x + self.time_pos_embed[:, :x.size(1), :]
+
+        for layer in self.layers:
+            x = layer(x)
+
+        x = self.norm(x)
+
+        pooled = x.mean(dim=1)
+        out = self.head(pooled)
+
+        if return_features:
+            return out, x, pooled
+
+        return out
+
+
+class IPerformerModel(PerformerModel):
+
+    def __init__(self, *, local_kernel_size=3, **performer_kwargs):
+        super().__init__(
+            encoder_layer_cls=LocalGlobalPerformerEncoderLayer,
+            encoder_layer_kwargs={"local_kernel_size": local_kernel_size},
+            **performer_kwargs)
+
+
+"""Python port of the authors' POA exploration, exploitation and phase switching.
+
+Sources (compare equations and the MATLAB functions Exploration.m,
+Exploitation.m and Puma.m):
+https://github.com/Benyamin-abdollahzadeh/Puma-Optimizer-PO-
+
+The MATLAB routine is iteration-based. This port completes MAX_ITER rounds.
+Actual objective calls are recorded separately, including initialization.
+"""
+
+from dataclasses import dataclass
+from time import perf_counter
+from typing import Callable, Optional
+
+import numpy as np
+
+
+@dataclass
+class Result:
+    best_x: np.ndarray
+    best_f: float
+    fes: int
+    seconds: float
+    first_target_fe: Optional[int]
+    first_target_seconds: Optional[float]
+    trace_fes: np.ndarray
+    trace_best_f: np.ndarray
+    trace_phase: list[str]
+    trace_iteration: np.ndarray
+    phase_history: list[dict]
+
+
+class POA:
+    name = "POA"
+
+    def _make_rng(self, seed):
+        return np.random.default_rng(seed)
+
+    def __init__(self, pop_size: int = 30, max_iter: int = 200):
+        if pop_size < 7 or max_iter < 3:
+            raise ValueError("Need at least 7 agents and 3 warmup iterations")
+        self.pop_size = int(pop_size)
+        self.max_iter = int(max_iter)
+
+        self.expected_fes = self.pop_size * (self.max_iter + 4)
+
+    def _modify_candidate(self, candidate, current, best, phase, scores, rng):
+
+        return candidate
+
+    def _reset_variant(self, dim):
+        pass
+
+    def _on_accepted(self, phase, old_x, new_x, old_f, new_f):
+        pass
+
+    def _set_bounds(self, lb, ub):
+
+        self._lb, self._ub = lb, ub
+
+    def _select_warmup_survivors(self, population, cost, n):
+
+        return np.argsort(cost, kind="stable")[:n]
+
+    def _observe_population(self, population, cost, lb, ub):
+        pass
+
+    def solve(self, objective: Callable, lb, ub, seed: int,
+              target_f: Optional[float] = None) -> Result:
+        start = perf_counter()
+        rng = self._make_rng(seed)
+        lb = np.asarray(lb, dtype=float)
+        ub = np.asarray(ub, dtype=float)
+        dim, n = len(lb), self.pop_size
+        if ub.shape != lb.shape or not np.all(ub > lb):
+            raise ValueError("Bounds must have matching shapes and ub > lb")
+
+        self._reset_variant(dim)
+        self._set_bounds(lb, ub)
+
+        self._fes = 0
+        self._best_f = float("inf")
+        self._best_x = np.empty(dim, dtype=float)
+        self._first_target_fe = None
+        self._first_target_seconds = None
+        self._trace_fes, self._trace_best_f = [], []
+        self._trace_phase, self._trace_iteration = [], []
+        self._phase_history = []
+        self._phase = "INITIAL"
+        self._iteration = 0
+        self._target_f = target_f
+
+        def evaluate(x):
+            val = float(objective(x))
+            if not np.isfinite(val):
+                raise FloatingPointError("Objective returned a nonfinite value")
+            self._fes += 1
+            if val < self._best_f:
+                self._best_f = val
+                self._best_x = np.asarray(x, dtype=float).copy()
+            if (self._target_f is not None and self._first_target_fe is None
+                    and self._best_f <= self._target_f):
+                self._first_target_fe = self._fes
+                self._first_target_seconds = perf_counter() - start
+            self._trace_fes.append(self._fes)
+            self._trace_best_f.append(self._best_f)
+            self._trace_phase.append(self._phase)
+            self._trace_iteration.append(self._iteration)
+            return val
+
+        population = rng.uniform(lb, ub, size=(n, dim))
+        cost = np.array([evaluate(x) for x in population], dtype=float)
+        self._observe_population(population, cost, lb, ub)
+        initial_best_f = float(np.min(cost))
+        best_x = self._best_x.copy()
+        best_f = self._best_f
+
+
+        explore_best, exploit_best = [], []
+        for it in range(1, 4):
+            self._iteration = it
+            self._phase = "EXPLORATION_WARMUP"
+            exp_x, exp_f = self._exploration(population.copy(), cost.copy(),
+                                             best_x, (0., 0.), lb, ub, rng, evaluate)
+            explore_best.append(float(np.min(exp_f)))
+            self._phase = "EXPLOITATION_WARMUP"
+            dev_x, dev_f = self._exploitation(population.copy(), cost.copy(),
+                                              best_x, (0., 0.), lb, ub, rng, evaluate, it)
+            exploit_best.append(float(np.min(dev_f)))
+            population = np.vstack((population, exp_x, dev_x))
+            cost = np.concatenate((cost, exp_f, dev_f))
+            keep = self._select_warmup_survivors(population, cost, n)
+            population, cost = population[keep].copy(), cost[keep].copy()
+            best_x, best_f = population[0].copy(), float(cost[0])
+            self._observe_population(population, cost, lb, ub)
+            self._phase_history.append({"iteration": it, "phase": "BOTH",
+                                        "score_explore": None, "score_exploit": None,
+                                        "fes": self._fes, "best_f": best_f,
+                                        "n_explore": n, "n_exploit": n,
+                                        "reward_explore": None, "reward_exploit": None,
+                                        "radius_explore": getattr(self, "_radius_explore", None),
+                                        "radius_exploit": getattr(self, "_radius_exploit", None)})
+
+
+        seq_cost = np.ones((2, 3), dtype=float)
+        seq_time = np.ones((2, 3), dtype=float)
+        seq_cost[0] = [abs(initial_best_f - explore_best[0]),
+                       abs(explore_best[1] - explore_best[0]),
+                       abs(explore_best[2] - explore_best[1])]
+        seq_cost[1] = [abs(initial_best_f - exploit_best[0]),
+                       abs(exploit_best[1] - exploit_best[0]),
+                       abs(exploit_best[2] - exploit_best[1])]
+        pf = np.array([0.5, 0.5, 0.3])
+        historical_nonzero = [float(v) for v in seq_cost.ravel() if v != 0.]
+        f1 = pf[0] * seq_cost[:, 0] / seq_time[:, 0]
+        f2 = pf[1] * seq_cost.sum(axis=1) / seq_time.sum(axis=1)
+        scores = pf[0] * f1 + pf[1] * f2
+        unselected = np.ones(2, dtype=int)
+        f3 = np.zeros(2, dtype=float)
+        mega = np.full(2, 0.99, dtype=float)
+        flag_change = 0
+
+        for it in range(4, self.max_iter + 1):
+            self._iteration = it
+            before_scores = scores.copy()
+            selected = 0 if scores[0] > scores[1] else 1
+            self._phase = ("EXPLORATION" if selected == 0 else "EXPLOITATION")
+            if selected == 0:
+                population, cost = self._exploration(population, cost, best_x,
+                                                      tuple(scores), lb, ub, rng, evaluate)
+            else:
+                population, cost = self._exploitation(population, cost, best_x,
+                                                       tuple(scores), lb, ub, rng, evaluate, it)
+
+            self._observe_population(population, cost, lb, ub)
+            count_select = unselected.copy()
+            unselected[1 - selected] += 1
+            unselected[selected] = 1
+            f3[selected] = pf[2]
+            f3[1 - selected] += pf[2]
+            candidate_best = int(np.argmin(cost))
+            new_best_f = float(cost[candidate_best])
+            seq_cost[selected, 2] = seq_cost[selected, 1]
+            seq_cost[selected, 1] = seq_cost[selected, 0]
+            seq_cost[selected, 0] = abs(best_f - new_best_f)
+            if seq_cost[selected, 0] != 0.:
+                historical_nonzero.append(float(seq_cost[selected, 0]))
+            if new_best_f < best_f:
+                best_f, best_x = new_best_f, population[candidate_best].copy()
+
+            if flag_change != selected:
+                flag_change = selected
+                seq_time[:, 2] = seq_time[:, 1].copy()
+                seq_time[:, 1] = seq_time[:, 0].copy()
+                seq_time[:, 0] = count_select
+
+            f1 = pf[0] * seq_cost[:, 0] / seq_time[:, 0]
+            f2 = pf[1] * seq_cost.sum(axis=1) / seq_time.sum(axis=1)
+
+            if before_scores[0] < before_scores[1]:
+                mega[0] = max(mega[0] - 0.01, 0.01)
+                mega[1] = 0.99
+            elif before_scores[0] > before_scores[1]:
+                mega[0] = 0.99
+                mega[1] = max(mega[1] - 0.01, 0.01)
+
+
+            min_history = min(historical_nonzero, default=0.)
+            scores = mega * (f1 + f2) + (1. - mega) * min_history * f3
+            self._phase_history.append({"iteration": it, "phase": self._phase,
+                                        "score_explore": float(before_scores[0]),
+                                        "score_exploit": float(before_scores[1]),
+                                        "fes": self._fes, "best_f": best_f,
+                                        "n_explore": n if selected == 0 else 0,
+                                        "n_exploit": n if selected == 1 else 0,
+                                        "reward_explore": None, "reward_exploit": None,
+                                        "radius_explore": getattr(self, "_radius_explore", None),
+                                        "radius_exploit": getattr(self, "_radius_exploit", None)})
+
+        if self._fes != self.expected_fes:
+            raise RuntimeError(f"Expected {self.expected_fes} evaluations; got {self._fes}")
+        return Result(self._best_x.copy(), float(self._best_f), self._fes,
+                      perf_counter() - start, self._first_target_fe,
+                      self._first_target_seconds,
+                      np.asarray(self._trace_fes, dtype=int),
+                      np.asarray(self._trace_best_f, dtype=float),
+                      self._trace_phase[:],
+                      np.asarray(self._trace_iteration, dtype=int),
+                      self._phase_history[:])
+
+    def _exploration(self, pop, fitness, best, scores, lb, ub, rng, evaluate):
+        n, dim = pop.shape
+        order = np.argsort(fitness, kind="stable")
+        pop, fitness = pop[order].copy(), fitness[order].copy()
+        pcr = 0.20
+        p = (1. - pcr) / n
+        for i in range(n):
+            candidate = self._explore_candidate(pop, i, best, scores, pcr, lb, ub, rng)
+            value = evaluate(candidate)
+            if value < fitness[i]:
+                self._on_accepted("EXPLORATION", pop[i].copy(), candidate,
+                                  fitness[i], value)
+                pop[i], fitness[i] = candidate, value
+            else:
+                pcr += p
+        return pop, fitness
+
+    def _explore_candidate(self, pop, i, best, scores, pcr, lb, ub, rng):
+        n, dim = pop.shape
+        x = pop[i]
+        picks = rng.permutation(n)
+        picks = picks[picks != i][:6]
+        a, b, c, d, e, f = picks
+        gain = 2. * rng.random() - 1.
+        if rng.random() < 0.5:
+            y = rng.uniform(lb, ub)
+        else:
+            ab = pop[a] - pop[b]
+            cd = pop[c] - pop[d]
+            ef = pop[e] - pop[f]
+            y = pop[a] + gain * ab + gain * ((ab - cd) + (cd - ef))
+        y = np.clip(y, lb, ub)
+        j0 = rng.integers(dim)
+        mask = rng.random(dim) <= pcr
+        mask[j0] = True
+        candidate = np.where(mask, y, x)
+        return np.clip(self._modify_candidate(candidate, x, best,
+                                               "EXPLORATION", scores, rng), lb, ub)
+
+    def _exploitation(self, pop, fitness, best, scores, lb, ub, rng, evaluate, iteration):
+        n, dim = pop.shape
+        for i in range(n):
+            candidate = self._exploit_candidate(pop, i, best, scores, lb, ub, rng, iteration)
+            value = evaluate(candidate)
+            if value < fitness[i]:
+                self._on_accepted("EXPLOITATION", pop[i].copy(), candidate,
+                                  fitness[i], value)
+                pop[i], fitness[i] = candidate, value
+        return pop, fitness
+
+    def _exploit_candidate(self, pop, i, best, scores, lb, ub, rng, iteration):
+        n, dim = pop.shape
+        q, beta = 0.67, 2.
+        beta1 = 2. * rng.random()
+        beta2 = rng.standard_normal(dim)
+        w, v = rng.standard_normal(dim), rng.standard_normal(dim)
+        f1 = rng.standard_normal(dim) * np.exp(2. - iteration * (2. / self.max_iter))
+        f2 = w * (v ** 2) * np.cos((2. * rng.random()) * w)
+        mbest = np.mean(pop) / n
+        r1 = 2. * rng.random() - 1.
+        s1 = (2. * rng.random() - 1.) + rng.standard_normal(dim)
+        s2 = f1 * r1 * pop[i] + f2 * (1. - r1) * best
+
+
+        denom = float(np.dot(s1, s1))
+        vec = float(np.dot(s2, s1) / denom) if denom > 1e-300 else 0.0
+        if rng.random() <= 0.5:
+            if rng.random() > q:
+                peer = pop[rng.integers(n)]
+                with np.errstate(over="ignore"):
+                    candidate = best + beta1 * np.exp(beta2) * (peer - pop[i])
+            else:
+                candidate = beta1 * vec - best
+        else:
+            peer = pop[rng.integers(n)]
+            sign = (-1.) ** rng.integers(0, 2)
+            candidate = (mbest * peer - sign * pop[i]) / (1. + beta * rng.random())
+        candidate = np.nan_to_num(candidate, nan=0., posinf=1e308, neginf=-1e308)
+        candidate = np.clip(candidate, lb, ub)
+        return np.clip(self._modify_candidate(candidate, pop[i], best,
+                                               "EXPLOITATION", scores, rng), lb, ub)
+
+
+"""Differential-exploration operator competition shared by MPOA/MFPOA.
+
+One strategy is selected before each differential candidate is generated.
+Feedback uses its single evaluated result after the reference policy, crossover and bounds. The 50% uniform branch and exploitation are not modified by M.
+Inspired by adaptive operator selection; not a reproduction of full SaDE.
+"""
+
+import numpy as np
+
+
+class MultiStrategyMixin:
+    strategy_names = ("POA_DIFF", "DE_RAND_1", "DE_CURRENT_TO_RAND_1")
+
+    def __init__(self, pop_size=30, max_iter=200, m_enabled=True, m_scale=0.50,
+                 m_quality_alpha=0.10, m_probability_alpha=0.20,
+                 m_min_probability=0.10, m_gain_weight=0.50,
+                 m_initial_quality=0.50, **kwargs):
+        if not isinstance(m_enabled, (bool, np.bool_)):
+            raise ValueError("m_enabled must be boolean")
+        settings = np.asarray([m_scale, m_quality_alpha, m_probability_alpha,
+                               m_min_probability, m_gain_weight, m_initial_quality])
+        if not np.all(np.isfinite(settings)):
+            raise ValueError("M settings must be finite")
+        if not 0 < m_scale <= 2:
+            raise ValueError("m_scale must be in (0, 2]")
+        if not 0 < m_quality_alpha <= 1 or not 0 < m_probability_alpha <= 1:
+            raise ValueError("M smoothing rates must be in (0, 1]")
+        if not 0 < m_min_probability < 1 / len(self.strategy_names):
+            raise ValueError("Require 0 < min probability < 1/3")
+        if not 0 <= m_gain_weight <= 1 or not 0 < m_initial_quality <= 1:
+            raise ValueError("gain_weight must be in [0,1]; initial_quality in (0,1]")
+        super().__init__(pop_size=pop_size, max_iter=max_iter, **kwargs)
+        self.m_enabled = bool(m_enabled)
+        self.m_scale = float(m_scale)
+        self.m_quality_alpha = float(m_quality_alpha)
+        self.m_probability_alpha = float(m_probability_alpha)
+        self.m_min_probability = float(m_min_probability)
+        self.m_gain_weight = float(m_gain_weight)
+        self.m_initial_quality = float(m_initial_quality)
+
+    def _make_rng(self, seed):
+        self._m_rng = np.random.default_rng(np.random.SeedSequence([seed, 57839]))
+        return super()._make_rng(seed)
+
+    def _reset_variant(self, dim):
+        super()._reset_variant(dim)
+        k = len(self.strategy_names)
+        self._m_quality = np.full(k, self.m_initial_quality)
+        self._m_probability = np.full(k, 1. / k)
+        self._m_pending_strategy = None
+        self._m_pending_index = None
+        self.strategy_history = []
+
+    def _explore_candidate(self, pop, i, best, scores, pcr, lb, ub, rng):
+        if not self.m_enabled:
+            return super()._explore_candidate(pop, i, best, scores, pcr, lb, ub, rng)
+        n, dim = pop.shape
+        current = pop[i]
+        picks = rng.permutation(n)
+        picks = picks[picks != i][:6]
+        a, b, c, d, e, f = picks
+        gain = 2. * rng.random() - 1.
+        uniform_branch = rng.random() < 0.3
+        self._m_pending_index, self._m_pending_strategy = i, None
+        if uniform_branch:
+            y = rng.uniform(lb, ub)
+        else:
+            strategy = int(self._m_rng.choice(len(self.strategy_names), p=self._m_probability))
+            self._m_pending_strategy = strategy
+            a, b, c, d, e, f = self._m_reference_indices(pop, i, picks, strategy)
+            if strategy == 0:
+                ab, cd, ef = pop[a] - pop[b], pop[c] - pop[d], pop[e] - pop[f]
+                y = pop[a] + gain * ab + gain * ((ab - cd) + (cd - ef))
+            elif strategy == 1:
+                y = pop[a] + self.m_scale * (pop[b] - pop[c])
+            else:
+                attraction = self._m_rng.random()
+                y = (current + attraction * (pop[a] - current)
+                     + self.m_scale * (pop[b] - pop[c]))
+        y = np.clip(y, lb, ub)
+        j0 = rng.integers(dim)
+        effective_pcr = self._m_crossover_rate(pcr, dim, uniform_branch)
+        mask = rng.random(dim) <= effective_pcr
+        mask[j0] = True
+        candidate = np.where(mask, y, current)
+        if not uniform_branch:
+            candidate = self._m_step_hook(candidate, current)
+        return candidate
+
+    def _m_crossover_rate(self, pcr, dim, uniform_branch):
+
+        return pcr
+
+    def _m_reference_indices(self, pop, i, picks, strategy):
+
+        return tuple(picks)
+
+    def _m_step_hook(self, candidate, current):
+
+        return candidate
+
+    def _exploration(self, pop, fitness, best, scores, lb, ub, rng, evaluate):
+        if not self.m_enabled:
+            return super()._exploration(pop, fitness, best, scores, lb, ub, rng, evaluate)
+
+
+        order = np.argsort(fitness, kind="stable")
+        parent_fitness = fitness[order].copy()
+        before_probability = self._m_probability.copy()
+        before_quality = self._m_quality.copy()
+        k = len(self.strategy_names)
+        attempts, successes = np.zeros(k, dtype=int), np.zeros(k, dtype=int)
+        rewards, gains = np.zeros(k), np.zeros(k)
+        self._m_pending_strategy, self._m_pending_index = None, None
+
+        def evaluated_feedback(candidate):
+            value = evaluate(candidate)
+            strategy, index = self._m_pending_strategy, self._m_pending_index
+            if strategy is not None:
+                old = float(parent_fitness[index])
+                success = value < old
+                normalized_gain = 0.
+                if success:
+
+
+                    scale = max(1., abs(old), abs(value))
+                    old_scaled, new_scaled = old / scale, value / scale
+                    denominator = abs(old_scaled) + abs(new_scaled) + 1e-12
+                    normalized_gain = float(np.clip((old_scaled-new_scaled) / denominator, 0., 1.))
+                reward = (1. - self.m_gain_weight) * float(success) + self.m_gain_weight * normalized_gain
+                attempts[strategy] += 1
+                successes[strategy] += int(success)
+                gains[strategy] += normalized_gain
+                rewards[strategy] += reward
+                self._m_quality[strategy] += self.m_quality_alpha * (reward - self._m_quality[strategy])
+            self._m_pending_strategy, self._m_pending_index = None, None
+            return value
+
+        result = super()._exploration(pop, fitness, best, scores, lb, ub, rng, evaluated_feedback)
+        if attempts.sum():
+            quality_sum = float(self._m_quality.sum())
+            shares = (self._m_quality / quality_sum if quality_sum > np.finfo(float).tiny
+                      else np.full(k, 1. / k))
+            target = self.m_min_probability + (1. - k*self.m_min_probability) * shares
+            self._m_probability = ((1. - self.m_probability_alpha)*self._m_probability
+                                   + self.m_probability_alpha*target)
+            self._m_probability /= self._m_probability.sum()
+
+        for index, name in enumerate(self.strategy_names):
+            count = int(attempts[index])
+            self.strategy_history.append({
+                "iteration": self._iteration, "phase": self._phase, "fes": self._fes,
+                "strategy": name, "reference_policy": "FITNESS_DISTANCE" if getattr(self, "f_enabled", False) else "UNIFORM",
+                "attempts": count, "successes": int(successes[index]),
+                "success_rate": float(successes[index]/count) if count else "",
+                "mean_normalized_gain": float(gains[index]/count) if count else "",
+                "mean_reward": float(rewards[index]/count) if count else "",
+                "quality_before": float(before_quality[index]),
+                "quality_after": float(self._m_quality[index]),
+                "probability_before": float(before_probability[index]),
+                "probability_after": float(self._m_probability[index]),
+            })
+        return result
+
+
+"""F reference selection shared by FOA and MFPOA.
+
+FOA is the user-requested label for the F-only POA ablation. F scores use
+current-population average fitness ranks and distance to the CURRENT agent,
+inspired by https://doi.org/10.1016/j.knosys.2019.105169 . This is not a
+canonical FDB reproduction. MFPOA applies the same F policy to the selected
+M strategy's base/reference or attraction target, using a strategy-specific
+quality/distance balance. FOA retains its single POA_DIFF balance.
+Other peers remain random. All weights are predeclared, not performance claims.
+"""
+
+from math import sqrt
+
+import numpy as np
+
+
+class FitnessGuideMixin:
+    def __init__(self, pop_size=30, max_iter=200, f_enabled=True,
+                 f_quality_weight=0.60, f_uniform_mix=0.05,
+                 f_strategy_coupling=True,
+                 f_strategy_quality_weights=(0.60, 0.35, 0.80), **kwargs):
+        if not isinstance(f_enabled, (bool, np.bool_)):
+            raise ValueError("f_enabled must be boolean")
+        if not np.all(np.isfinite((f_quality_weight, f_uniform_mix))):
+            raise ValueError("F parameters must be finite")
+        if not 0 <= f_quality_weight <= 1 or not 0 <= f_uniform_mix <= 1:
+            raise ValueError("F quality weight and uniform mix must be in [0,1]")
+        if not isinstance(f_strategy_coupling, (bool, np.bool_)):
+            raise ValueError("f_strategy_coupling must be boolean")
+        weights = np.asarray(f_strategy_quality_weights, dtype=float)
+        if weights.shape != (3,) or not np.all(np.isfinite(weights)) or np.any((weights < 0) | (weights > 1)):
+            raise ValueError("Require three finite strategy quality weights in [0,1]")
+        if weights[0] != f_quality_weight:
+            raise ValueError("POA_DIFF quality weight must match the F-only quality weight")
+        super().__init__(pop_size=pop_size, max_iter=max_iter, **kwargs)
+        self.f_enabled = bool(f_enabled)
+        self.f_quality_weight = float(f_quality_weight)
+        self.f_uniform_mix = float(f_uniform_mix)
+        self.f_strategy_coupling = bool(f_strategy_coupling)
+        self.f_strategy_quality_weights = tuple(map(float, weights))
+
+    def _make_rng(self, seed):
+        self._f_rng = np.random.default_rng(np.random.SeedSequence([seed, 42191]))
+        return super()._make_rng(seed)
+
+    def _reset_variant(self, dim):
+        super()._reset_variant(dim)
+        self.guide_history = []
+        self.coupling_history = []
+        self._f_pending = None
+
+    def _quality(self, fitness):
+        _, inverse, counts = np.unique(fitness, return_inverse=True, return_counts=True)
+        average_ranks = np.cumsum(counts)-0.5*(counts+1)
+        return 1.0-average_ranks[inverse]/max(1, len(fitness)-1)
+
+    def _reference_quality_weight(self, strategy):
+
+        if (strategy is not None and self.f_strategy_coupling
+                and getattr(self, "m_enabled", False)):
+            return self.f_strategy_quality_weights[strategy]
+        return self.f_quality_weight
+
+    def _select_reference(self, pop, i, strategy=None):
+        n, dim = pop.shape
+        eligible = np.flatnonzero(np.arange(n) != i)
+        quality = self._quality(self._f_live_fitness)[eligible]
+        distances = np.linalg.norm((pop[eligible]-pop[i])/(self._ub-self._lb), axis=1)/sqrt(dim)
+        maximum = float(distances.max())
+        scaled_distance = distances/maximum if maximum > 0.0 else np.zeros_like(distances)
+        quality_weight = self._reference_quality_weight(strategy)
+        score = quality_weight*quality+(1.0-quality_weight)*scaled_distance
+        total = float(score.sum())
+        probability = score/total if total > 0.0 else np.full(len(eligible), 1.0/len(eligible))
+        probability = (1.0-self.f_uniform_mix)*probability+self.f_uniform_mix/len(eligible)
+        probability /= probability.sum()
+        selected = int(self._f_rng.choice(len(eligible), p=probability))
+        positive = probability[probability > 0.0]
+        entropy = float(-np.sum(positive*np.log(positive))/np.log(len(eligible)))
+        return int(eligible[selected]), {
+            "quality": float(quality[selected]), "distance": float(distances[selected]),
+            "scaled_distance": float(scaled_distance[selected]), "probability_entropy": entropy,
+            "quality_weight": float(quality_weight),
+            "distance_weight": float(1.0-quality_weight)}
+
+    def _m_reference_indices(self, pop, i, picks, strategy):
+        if not self.f_enabled:
+            return super()._m_reference_indices(pop, i, picks, strategy)
+        reference, info = self._select_reference(pop, i, strategy=strategy)
+
+
+        others = picks[picks != reference][:5]
+        info["strategy"] = self.strategy_names[strategy]
+        info["strategy_index"] = strategy
+        info["role"] = "ATTRACTION_TARGET" if strategy == 2 else "BASE_REFERENCE"
+        self._f_pending = (i, info)
+        return (reference, *map(int, others))
+
+    def _explore_candidate(self, pop, i, best, scores, pcr, lb, ub, rng):
+        if not self.f_enabled:
+            return super()._explore_candidate(pop, i, best, scores, pcr, lb, ub, rng)
+        self._f_pending = (i, None)
+        if getattr(self, "m_enabled", False):
+
+            return super()._explore_candidate(pop, i, best, scores, pcr, lb, ub, rng)
+
+        n, dim = pop.shape
+        current = pop[i]
+        picks = rng.permutation(n)
+        picks = picks[picks != i]
+        gain = 2.0*rng.random()-1.0
+        uniform_branch = rng.random() < 0.5
+        info = None
+        if uniform_branch:
+            y = rng.uniform(lb, ub)
+        else:
+            a, info = self._select_reference(pop, i)
+            b, c, d, e, f = picks[picks != a][:5]
+            ab, cd, ef = pop[a]-pop[b], pop[c]-pop[d], pop[e]-pop[f]
+            y = pop[a]+gain*ab+gain*((ab-cd)+(cd-ef))
+            info["strategy"], info["role"], info["strategy_index"] = "POA_DIFF", "BASE_REFERENCE", 0
+        y = np.clip(y, lb, ub)
+        forced = rng.integers(dim)
+        mask = rng.random(dim) <= pcr
+        mask[forced] = True
+        self._f_pending = (i, info)
+        return np.clip(np.where(mask, y, current), lb, ub)
+
+    def _exploration(self, pop, fitness, best, scores, lb, ub, rng, evaluate):
+        if not self.f_enabled:
+            return super()._exploration(pop, fitness, best, scores, lb, ub, rng, evaluate)
+        order = np.argsort(fitness, kind="stable")
+        self._f_live_fitness = fitness[order].copy()
+        self._f_pending = None
+        attempts = successes = uniform_attempts = 0
+        sums = {key: 0.0 for key in ("quality", "distance", "scaled_distance", "probability_entropy",
+                                    "quality_weight", "distance_weight")}
+        base_references = attraction_targets = 0
+        m_active = bool(getattr(self, "m_enabled", False))
+        if m_active:
+            probability_before = self._m_probability.copy()
+            strategy_attempts, strategy_successes = [0]*3, [0]*3
+            strategy_sums = [{key: 0.0 for key in sums} for _ in range(3)]
+
+        def feedback(candidate):
+            nonlocal attempts, successes, uniform_attempts, base_references, attraction_targets
+            value = evaluate(candidate)
+            index, info = self._f_pending
+            improved = value < self._f_live_fitness[index]
+            if info is None:
+                uniform_attempts += 1
+            else:
+                attempts += 1
+                successes += int(improved)
+                base_references += int(info["role"] == "BASE_REFERENCE")
+                attraction_targets += int(info["role"] == "ATTRACTION_TARGET")
+                for key in sums:
+                    sums[key] += info[key]
+                if m_active:
+                    strategy = info["strategy_index"]
+                    strategy_attempts[strategy] += 1
+                    strategy_successes[strategy] += int(improved)
+                    for key in sums:
+                        strategy_sums[strategy][key] += info[key]
+            if improved:
+                self._f_live_fitness[index] = value
+            self._f_pending = None
+            return value
+
+        result = super()._exploration(pop, fitness, best, scores, lb, ub, rng, feedback)
+        self.guide_history.append({
+            "iteration": self._iteration, "phase": self._phase, "fes": self._fes,
+            "differential_attempts": attempts, "differential_successes": successes,
+            "differential_success_rate": successes/attempts if attempts else "",
+            "uniform_attempts": uniform_attempts,
+            "base_reference_attempts": base_references, "attraction_target_attempts": attraction_targets,
+            **{"mean_reference_"+key: value/attempts if attempts else ""
+               for key, value in sums.items()}})
+        if m_active:
+
+
+            for strategy, name in enumerate(self.strategy_names):
+                count = strategy_attempts[strategy]
+                weight = self._reference_quality_weight(strategy)
+                self.coupling_history.append({
+                    "iteration": self._iteration, "phase": self._phase, "fes": self._fes,
+                    "strategy": name, "coupling_enabled": self.f_strategy_coupling,
+                    "reference_role": "ATTRACTION_TARGET" if strategy == 2 else "BASE_REFERENCE",
+                    "quality_weight": weight, "distance_weight": 1.0-weight,
+                    "attempts": count, "successes": strategy_successes[strategy],
+                    "success_rate": strategy_successes[strategy]/count if count else "",
+                    "probability_before": float(probability_before[strategy]),
+                    "probability_after": float(self._m_probability[strategy]),
+                    **{"mean_reference_"+key: value/count if count else ""
+                       for key, value in strategy_sums[strategy].items()}})
+        return result
+
+
+"""M + F POA, with shared H rules active at both D10 and D20 by default.
+
+At D <= h_reference_dim, or h_enabled=False, search behavior matches the
+uploaded original MFPOA. Extra hooks make no objective calls or RNG draws.
+Default reference_dim=6 activates H at both CEC2022 dimensions (10/20).
+H is an additional mechanism, not a claim of demonstrated performance gain.
+"""
+
+import numpy as np
+
+
+class MFPOA(FitnessGuideMixin, MultiStrategyMixin, POA):
+    name = "MFPOA"
+
+    def __init__(self, pop_size=30, max_iter=200, h_enabled=True,
+                 h_reference_dim=6, h_unique_warmup=True,
+                 h_uniform_crossover=True, **kwargs):
+        for name, value in (("h_enabled", h_enabled),
+                            ("h_unique_warmup", h_unique_warmup),
+                            ("h_uniform_crossover", h_uniform_crossover)):
+            if not isinstance(value, (bool, np.bool_)):
+                raise ValueError(name + " must be boolean")
+        if (isinstance(h_reference_dim, (bool, np.bool_))
+                or not isinstance(h_reference_dim, (int, np.integer))
+                or h_reference_dim < 2):
+            raise ValueError("h_reference_dim must be an integer >= 2")
+        super().__init__(pop_size=pop_size, max_iter=max_iter, **kwargs)
+        self.h_enabled = bool(h_enabled)
+        self.h_reference_dim = int(h_reference_dim)
+        self.h_unique_warmup = bool(h_unique_warmup)
+        self.h_uniform_crossover = bool(h_uniform_crossover)
+
+    def _reset_variant(self, dim):
+        super()._reset_variant(dim)
+        self.diagnostics_history = []
+        self.warmup_survival_history = []
+        self._h_uniform_rates = []
+
+    def _h_active(self, dim):
+
+        return (self.h_enabled and dim > self.h_reference_dim
+                and self.m_enabled and self.f_enabled)
+
+    def _select_warmup_survivors(self, population, cost, n):
+        dim = population.shape[1]
+        order = np.argsort(cost, kind="stable")
+        enabled = self._h_active(dim) and self.h_unique_warmup
+        original = order[:n]
+        if enabled:
+
+
+            _, first = np.unique(population[order], axis=0, return_index=True)
+            distinct = order[np.sort(first)]
+            keep = distinct[:n]
+            if len(keep) < n:
+
+
+                remaining = order[~np.isin(order, keep)]
+                keep = np.concatenate((keep, remaining[:n-len(keep)]))
+            keep = keep[np.argsort(cost[keep], kind="stable")]
+        else:
+            keep = super()._select_warmup_survivors(population, cost, n)
+        self.warmup_survival_history.append({
+            "iteration": self._iteration, "dimension": dim,
+            "unique_priority_enabled": enabled, "pool_size": len(cost),
+            "pool_unique_positions": len(np.unique(population, axis=0)),
+            "original_selection_unique_positions": len(np.unique(population[original], axis=0)),
+            "selected_unique_positions": len(np.unique(population[keep], axis=0)),
+            "survivors": len(keep), "additional_objective_calls": 0})
+        return keep
+
+    def _m_crossover_rate(self, pcr, dim, uniform_branch):
+        rate = super()._m_crossover_rate(pcr, dim, uniform_branch)
+        if uniform_branch and self._h_active(dim) and self.h_uniform_crossover:
+            rate *= (self.h_reference_dim - 1) / (dim - 1)
+        if uniform_branch:
+            self._h_uniform_rates.append((float(pcr), float(rate)))
+        return rate
+
+    def _observe_population(self, population, cost, lb, ub):
+        n, dim = population.shape
+        normalized = (population-lb)/(ub-lb)
+        rates = np.asarray(self._h_uniform_rates, dtype=float)
+        self._h_uniform_rates.clear()
+        self.diagnostics_history.append({
+            "iteration": self._iteration, "phase": self._phase,
+            "fes": self._fes, "dimension": dim, "h_active": self._h_active(dim),
+            "unique_positions": len(np.unique(population, axis=0)),
+            "population": n,
+            "normalized_rms_spread": float(np.sqrt(np.mean(np.var(normalized, axis=0)))),
+            "boundary_coordinate_fraction": float(np.mean((population == lb)|(population == ub))),
+            "uniform_attempts_since_observation": len(rates),
+            "mean_original_uniform_pcr": float(rates[:,0].mean()) if len(rates) else "",
+            "mean_effective_uniform_pcr": float(rates[:,1].mean()) if len(rates) else "",
+            "expected_uniform_crossed_coordinates": float(1+(dim-1)*rates[:,1].mean()) if len(rates) else "",
+            "population_best_f": float(np.min(cost))})
+
+
+SEARCH_POP_SIZE = 15
+SEARCH_MAX_ITER = 8
+SEARCH_EPOCHS = 30
+SEARCH_PATIENCE = 6
+SEARCH_SEEDS = (42,)
+SEARCH_MFPOA_SEED = 42
+
+
+H_ENABLED = True
+H_REFERENCE_DIM = 6
+H_UNIQUE_WARMUP = True
+H_UNIFORM_CROSSOVER = True
+MFPOA_PARAMETERS = {
+    "m_enabled": True,
+    "m_scale": 0.50,
+    "m_quality_alpha": 0.10,
+    "m_probability_alpha": 0.20,
+    "m_min_probability": 0.10,
+    "m_gain_weight": 0.50,
+    "m_initial_quality": 0.50,
+    "f_enabled": True,
+    "f_quality_weight": 0.60,
+    "f_uniform_mix": 0.05,
+    "f_strategy_coupling": True,
+    "f_strategy_quality_weights": (0.60, 0.35, 0.80),
+    "h_enabled": H_ENABLED,
+    "h_reference_dim": H_REFERENCE_DIM,
+    "h_unique_warmup": H_UNIQUE_WARMUP,
+    "h_uniform_crossover": H_UNIFORM_CROSSOVER,
+}
+
+REFINE_TOP_K = 5
+REFINE_SEEDS = (42,)
+
+
+WEIGHT_MAE, WEIGHT_RMSE, WEIGHT_MAPE = 0.4, 0.4, 0.2
+TRAIN_PRICE_SCALE = float(np.median(np.abs(
+    scaler_y.inverse_transform(y_train.reshape(-1, 1)))))
+VAL_PRICE = scaler_y.inverse_transform(y_val.reshape(-1, 1)).reshape(-1)
+if (not np.isfinite(TRAIN_PRICE_SCALE) or TRAIN_PRICE_SCALE <= 0
+        or np.any(np.abs(VAL_PRICE) < 1e-8)):
+    raise ValueError("综合指标要求训练价格尺度为正，且验证 Close 不为零")
+
+
+def validation_score(pred_scaled):
+
+    pred_price = scaler_y.inverse_transform(
+        np.asarray(pred_scaled).reshape(-1, 1)).reshape(-1)
+    if pred_price.size != VAL_PRICE.size or not np.isfinite(pred_price).all():
+        raise ValueError("验证预测长度或数值不合法")
+    absolute_error = np.abs(pred_price - VAL_PRICE)
+    metrics = {
+        "mae": float(np.mean(absolute_error)),
+        "rmse": float(np.sqrt(np.mean(absolute_error ** 2))),
+        "mape": float(np.mean(absolute_error / np.abs(VAL_PRICE))),
+    }
+    metrics["score"] = (
+        WEIGHT_MAE * metrics["mae"] / TRAIN_PRICE_SCALE
+        + WEIGHT_RMSE * metrics["rmse"] / TRAIN_PRICE_SCALE
+        + WEIGHT_MAPE * metrics["mape"])
+    return metrics
+
+
+SEARCH_DIM = 7
+SEARCH_LB = np.zeros(SEARCH_DIM, dtype=np.float64)
+SEARCH_UB = np.ones(SEARCH_DIM, dtype=np.float64)
+
+
+def decode_candidate(position):
+
+    p = np.clip(np.asarray(position, dtype=np.float64), 0.0, 1.0)
+    if p.shape != (SEARCH_DIM,) or not np.isfinite(p).all():
+        raise ValueError("MFPOA 候选向量必须是有限的 7 维向量")
+
+    def category(value, options):
+        return options[min(int(value * len(options)), len(options) - 1)]
+
+    return {
+        "d_model": category(p[0], (32, 64, 96, 128)),
+        "num_layers": category(p[1], (1, 2, 3, 4)),
+        "n_heads": category(p[2], (2, 4, 8)),
+        "nb_features": category(p[3], (32, 64, 128, 256)),
+        "local_kernel_size": category(p[4], (3, 5)),
+        "dropout": float(0.05 + p[5] * 0.25),
+        "lr": float(np.exp(np.log(1e-4) + p[6] *
+                           (np.log(1e-2) - np.log(1e-4)))),
+    }
+
+
+def trial_validation_score(cfg, trial_seed, max_epochs=SEARCH_EPOCHS,
+                           patience=SEARCH_PATIENCE):
+
+    seed_everything(trial_seed)
+    trial_model = IPerformerModel(
+        input_dim=INPUT_DIM, seq_len=SEQ_LEN,
+        d_model=cfg["d_model"], num_layers=cfg["num_layers"],
+        n_heads=cfg["n_heads"], nb_features=cfg["nb_features"],
+        local_kernel_size=cfg["local_kernel_size"],
+        dim_feedforward=DIM_FEEDFORWARD, dropout=cfg["dropout"],
+        use_time_pos_embed=USE_TIME_POS_EMBED,
+        redraw_projection=REDRAW_PROJECTION).to(device)
+    trial_optimizer = optim.AdamW(trial_model.parameters(),
+                                  lr=cfg["lr"], weight_decay=WEIGHT_DECAY)
+    trial_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        trial_optimizer, mode="min", factor=SCHEDULER_FACTOR,
+        patience=SCHEDULER_PATIENCE, min_lr=MIN_LR)
+    trial_criterion = nn.SmoothL1Loss()
+    train_generator = torch.Generator().manual_seed(trial_seed)
+    trial_train_loader = DataLoader(
+        TensorDataset(torch_X_train, torch_y_train),
+        batch_size=BATCH_SIZE, shuffle=True, generator=train_generator)
+    trial_val_loader = DataLoader(
+        TensorDataset(torch_X_val, torch_y_val),
+        batch_size=BATCH_SIZE, shuffle=False)
+
+    best_score, best_metrics, stale, best_epoch = float("inf"), None, 0, 0
+    for epoch in range(1, max_epochs + 1):
+        trial_model.train()
+        for xb, yb in trial_train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            trial_optimizer.zero_grad(set_to_none=True)
+            output = trial_model(xb)
+            loss = trial_criterion(output, yb)
+            if not torch.isfinite(loss):
+                raise FloatingPointError("搜索候选训练损失非有限值")
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trial_model.parameters(), GRAD_CLIP)
+            trial_optimizer.step()
+
+        trial_model.eval()
+        val_loss_sum, val_count, val_predictions = 0.0, 0, []
+        with torch.no_grad():
+            for xb, yb in trial_val_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                output = trial_model(xb)
+                val_loss_sum += float(trial_criterion(output, yb)) * len(xb)
+                val_predictions.append(output.detach().cpu().numpy())
+                val_count += len(xb)
+        val_loss = val_loss_sum / val_count
+        metrics = validation_score(np.concatenate(val_predictions))
+        if not np.isfinite(val_loss) or not np.isfinite(metrics["score"]):
+            raise FloatingPointError("搜索候选验证指标非有限值")
+        trial_scheduler.step(metrics["score"])
+        if metrics["score"] < best_score - 1e-12:
+            best_score = metrics["score"]
+            best_metrics = metrics
+            best_epoch = epoch
+            stale = 0
+        else:
+            stale += 1
+            if stale >= patience:
+                break
+
+    return float(best_score), int(best_epoch), best_metrics
+
+
+if (SEARCH_EPOCHS < 1 or SEARCH_PATIENCE < 1 or not SEARCH_SEEDS
+        or REFINE_TOP_K < 1 or not REFINE_SEEDS):
+    raise ValueError("搜索/复核轮数、耐心值、候选数和随机种子必须为正")
+
+search_optimizer = MFPOA(pop_size=SEARCH_POP_SIZE,
+                         max_iter=SEARCH_MAX_ITER,
+                         **MFPOA_PARAMETERS)
+search_records = []
+search_cache = {}
+
+
+def search_objective(position):
+    cfg = decode_candidate(position)
+
+
+    key = json.dumps(cfg, sort_keys=True, allow_nan=False)
+    cached = key in search_cache
+    if cached:
+        score, epochs_by_seed, mean_metrics = search_cache[key]
+    else:
+        evaluated = [trial_validation_score(cfg, seed) for seed in SEARCH_SEEDS]
+        score = float(np.mean([result[0] for result in evaluated]))
+        epochs_by_seed = [result[1] for result in evaluated]
+        mean_metrics = {name: float(np.mean([result[2][name] for result in evaluated]))
+                        for name in ("mae", "rmse", "mape")}
+        search_cache[key] = (score, epochs_by_seed, mean_metrics)
+
+    record = {"FE": len(search_records) + 1,
+              "phase": search_optimizer._phase,
+              "iteration": search_optimizer._iteration,
+              "cached": cached, "fitness_composite": score,
+              "val_mae": mean_metrics["mae"],
+              "val_rmse": mean_metrics["rmse"],
+              "val_mape_percent": mean_metrics["mape"] * 100,
+              "epochs_by_seed": json.dumps(epochs_by_seed),
+              "position": json.dumps(np.asarray(position, dtype=float).tolist()),
+              **cfg}
+    search_records.append(record)
+    print("MFPOA FE={}/{} | val_composite={:.6f} | cached={}".format(
+        len(search_records), search_optimizer.expected_fes, score, cached))
+    return score
+
+
+print("MFPOA 搜索开始：{} 个种群 × {} 次迭代；预计 {} 次适应度调用".format(
+    SEARCH_POP_SIZE, SEARCH_MAX_ITER, search_optimizer.expected_fes))
+search_result = search_optimizer.solve(
+    search_objective, SEARCH_LB, SEARCH_UB, seed=SEARCH_MFPOA_SEED)
+if len(search_records) != search_result.fes:
+    raise AssertionError("MFPOA 实际评价次数与搜索日志不一致")
+
+first_stage_cfg = decode_candidate(search_result.best_x)
+pd.DataFrame(search_records).to_csv(
+    f"{RES_DIR}/mfpoa_search_trials.csv", index=False, encoding="utf-8-sig")
+pd.DataFrame({
+    "FE": search_result.trace_fes,
+    "iteration": search_result.trace_iteration,
+    "phase": search_result.trace_phase,
+    "best_val_composite": search_result.trace_best_f,
+}).to_csv(f"{RES_DIR}/mfpoa_convergence.csv", index=False,
+          encoding="utf-8-sig")
+pd.DataFrame(search_result.phase_history).to_csv(
+    f"{RES_DIR}/mfpoa_phase_history.csv", index=False,
+    encoding="utf-8-sig")
+
+
+for history_name, history in (
+        ("strategy_history", search_optimizer.strategy_history),
+        ("guide_history", search_optimizer.guide_history),
+        ("coupling_history", search_optimizer.coupling_history),
+        ("diagnostics", search_optimizer.diagnostics_history),
+        ("warmup_survival", search_optimizer.warmup_survival_history)):
+    pd.DataFrame(history).to_csv(
+        f"{RES_DIR}/mfpoa_{history_name}.csv", index=False,
+        encoding="utf-8-sig")
+
+
+baseline_cfg = {
+    "d_model": D_MODEL, "num_layers": NUM_LAYERS, "n_heads": N_HEADS,
+    "nb_features": NB_FEATURES, "local_kernel_size": LOCAL_KERNEL_SIZE,
+    "dropout": DROPOUT, "lr": LR,
+}
+ranked_configs = sorted(search_records,
+                        key=lambda row: row["fitness_composite"])
+refine_candidates = {}
+for row in ranked_configs:
+    cfg = {key: row[key] for key in baseline_cfg}
+    key = json.dumps(cfg, sort_keys=True)
+    refine_candidates.setdefault(key, cfg)
+    if len(refine_candidates) >= REFINE_TOP_K:
+        break
+baseline_key = json.dumps(baseline_cfg, sort_keys=True)
+refine_candidates.setdefault(baseline_key, baseline_cfg)
+
+refine_records = []
+for cfg in refine_candidates.values():
+    by_seed = [trial_validation_score(cfg, seed, EPOCHS, PATIENCE)
+               for seed in REFINE_SEEDS]
+    scores = [score for score, _, _ in by_seed]
+    refine_records.append({
+        **cfg,
+        "is_baseline_config": cfg == baseline_cfg,
+        "mean_val_composite": float(np.mean(scores)),
+        "std_val_composite": float(np.std(scores, ddof=1)) if len(scores) > 1 else None,
+        "mean_val_mae": float(np.mean([metrics["mae"] for _, _, metrics in by_seed])),
+        "mean_val_rmse": float(np.mean([metrics["rmse"] for _, _, metrics in by_seed])),
+        "mean_val_mape_percent": float(np.mean(
+            [metrics["mape"] for _, _, metrics in by_seed])) * 100,
+        "per_seed_val_composite": json.dumps(scores),
+        "best_epochs": json.dumps([epoch for _, epoch, _ in by_seed]),
+    })
+pd.DataFrame(refine_records).sort_values("mean_val_composite").to_csv(
+    f"{RES_DIR}/mfpoa_refinement.csv", index=False, encoding="utf-8-sig")
+
+
+best_refined = min(
+    refine_records, key=lambda row: row["mean_val_composite"])
+best_search_cfg = {key: best_refined[key] for key in baseline_cfg}
+print("复核选出配置：", best_search_cfg)
+print("复核平均验证集综合评分：", best_refined["mean_val_composite"])
+search_metadata = {
+    "optimizer": "MFPOA (uploaded MFPOA.zip: POA, M, F and H rules unchanged)",
+    "optimizer_parameters": MFPOA_PARAMETERS,
+    "search_dimension": SEARCH_DIM,
+    "h_active": search_optimizer._h_active(SEARCH_DIM),
+    "cache_policy": "exact decoded configuration; no continuous-parameter rounding",
+    "optimizer_source_sha256": {'POA.py': 'f09b6b1eddba48d68825741a030d6f453e733f29b6f534119fa23328dd94efa0', 'MULTISTRATEGY_CORE.py': '0cd49e4e76e82cf6f761313efce4075720fb615e7daae1d717ee6243c2a50571', 'FITNESS_GUIDE_CORE.py': '36686fb94a16c521aa5ced1b68a2981b5aa4086342710c9661c2a05c4b4e49c2', 'MFPOA.py': '3d799853b2052ebe2d24a9b436c83a3b071c0984d569815cdd2b5a85ef38bfd6'},
+    "population": SEARCH_POP_SIZE, "iterations": SEARCH_MAX_ITER,
+    "actual_fitness_calls": search_result.fes,
+    "unique_training_configs": len(search_cache),
+    "trial_trainings": len(search_cache) * len(SEARCH_SEEDS),
+    "refinement_candidates": len(refine_records),
+    "refinement_trainings": len(refine_records) * len(REFINE_SEEDS),
+    "refinement_epochs_max": EPOCHS,
+    "refinement_patience": PATIENCE,
+    "refinement_seeds": list(REFINE_SEEDS),
+    "search_epochs_max": SEARCH_EPOCHS,
+    "search_patience": SEARCH_PATIENCE,
+    "search_seeds": list(SEARCH_SEEDS),
+    "mfpoa_seed": SEARCH_MFPOA_SEED,
+    "fitness": "0.4*MAE/train_median_abs_close + 0.4*RMSE/train_median_abs_close + 0.2*MAPE_fraction; minimum validation composite epoch",
+    "fitness_weights": {"MAE": WEIGHT_MAE, "RMSE": WEIGHT_RMSE, "MAPE": WEIGHT_MAPE},
+    "train_median_abs_close": TRAIN_PRICE_SCALE,
+    "refinement_gate": "none; select minimum mean validation composite among all refinement candidates including baseline",
+    "final_training": "train split only; validation composite early stopping; test once after selection",
+    "first_stage_selected_config": first_stage_cfg,
+    "refined_mean_val_composite": best_refined["mean_val_composite"],
+    "selected_is_baseline_config": best_search_cfg == baseline_cfg,
+    "selected_config": best_search_cfg,
+    "best_search_composite": float(search_result.best_f),
+}
+with open(f"{RES_DIR}/mfpoa_search_settings.json", "w", encoding="utf-8") as handle:
+    json.dump(search_metadata, handle, indent=2, ensure_ascii=False)
+
+
+seed_everything(SEED)
+D_MODEL = best_search_cfg["d_model"]
+NUM_LAYERS = best_search_cfg["num_layers"]
+N_HEADS = best_search_cfg["n_heads"]
+NB_FEATURES = best_search_cfg["nb_features"]
+LOCAL_KERNEL_SIZE = best_search_cfg["local_kernel_size"]
+DROPOUT = best_search_cfg["dropout"]
+LR = best_search_cfg["lr"]
+
+model = IPerformerModel(
+    local_kernel_size=LOCAL_KERNEL_SIZE,
+    input_dim=INPUT_DIM,
+    seq_len=SEQ_LEN,
+    d_model=D_MODEL,
+    num_layers=NUM_LAYERS,
+    n_heads=N_HEADS,
+    nb_features=NB_FEATURES,
+    dim_feedforward=DIM_FEEDFORWARD,
+    dropout=DROPOUT,
+    use_time_pos_embed=USE_TIME_POS_EMBED,
+    redraw_projection=REDRAW_PROJECTION
+).to(device)
+
+def count_parameters(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    return total, trainable
+
+
+total_params, trainable_params = count_parameters(model)
+
+print("\n========== 模型结构检查 ==========")
+print("Model: MFPOA-iPerformer")
+print(f"Local convolution kernel: {LOCAL_KERNEL_SIZE}")
+print(f"Input SEQ_LEN: {SEQ_LEN}")
+print(f"Input dim: {INPUT_DIM}")
+print(f"d_model: {D_MODEL}")
+print(f"num_layers: {NUM_LAYERS}")
+print(f"n_heads: {N_HEADS}")
+print(f"nb_features: {NB_FEATURES}")
+print(f"use_time_pos_embed: {USE_TIME_POS_EMBED}")
+print(f"redraw_projection: {REDRAW_PROJECTION}")
+
+print("\n========== 参数量 ==========")
+print(f"Total params: {total_params}")
+print(f"Trainable params: {trainable_params}")
+
+
+optimizer = optim.AdamW(
+    model.parameters(),
+    lr=LR,
+    weight_decay=WEIGHT_DECAY
+)
+
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode="min",
+    factor=SCHEDULER_FACTOR,
+    patience=SCHEDULER_PATIENCE,
+    min_lr=MIN_LR
+)
+
+criterion = nn.SmoothL1Loss()
+
+train_loader = DataLoader(
+    TensorDataset(torch_X_train, torch_y_train),
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    generator=torch.Generator().manual_seed(SEED)
+)
+
+val_loader = DataLoader(
+    TensorDataset(torch_X_val, torch_y_val),
+    batch_size=BATCH_SIZE,
+    shuffle=False
+)
+
+test_loader = DataLoader(
+    TensorDataset(torch_X_test, torch_y_test),
+    batch_size=BATCH_SIZE,
+    shuffle=False
+)
+
+
+config = {
+    "model": "MFPOA-iPerformer",
+    "local_kernel_size": LOCAL_KERNEL_SIZE,
+    "structure": "Time embedding + parallel local depthwise convolution and global Performer attention + Mean Pooling",
+    "input_dim": INPUT_DIM,
+    "seq_len": SEQ_LEN,
+    "d_model": D_MODEL,
+    "num_layers": NUM_LAYERS,
+    "n_heads": N_HEADS,
+    "nb_features": NB_FEATURES,
+    "dim_feedforward": DIM_FEEDFORWARD,
+    "dropout": DROPOUT,
+    "use_time_pos_embed": USE_TIME_POS_EMBED,
+    "redraw_projection": REDRAW_PROJECTION,
+    "lr": LR,
+    "weight_decay": WEIGHT_DECAY,
+    "optimizer": "AdamW",
+    "scheduler": "ReduceLROnPlateau",
+    "scheduler_factor": SCHEDULER_FACTOR,
+    "scheduler_patience": SCHEDULER_PATIENCE,
+    "min_lr": MIN_LR,
+    "loss": "SmoothL1Loss",
+    "checkpoint_metric": "validation composite: MAE, RMSE, MAPE",
+    "batch_size": BATCH_SIZE,
+    "epochs": EPOCHS,
+    "patience": PATIENCE,
+    "device": str(device),
+    "total_params": total_params,
+    "trainable_params": trainable_params,
+    "train_samples": len(X_train),
+    "val_samples": len(X_val),
+    "test_samples": len(X_test)
+}
+
+config.update({"hpo_method": "MFPOA",
+               "hpo_fitness_calls": search_result.fes,
+               "hpo_best_val_composite": float(search_result.best_f)})
+
+pd.DataFrame([config]).to_csv(
+    f"{RES_DIR}/experiment_config.csv",
+    index=False,
+    encoding="utf-8-sig"
+)
+
+print("\n========== 实验配置 ==========")
+for k, v in config.items():
+    print(f"{k}: {v}")
+
+
+train_losses = []
+val_losses = []
+val_rmses = []
+val_maes = []
+val_mapes = []
+val_scores = []
+learning_rates = []
+
+best_val_score = float("inf")
+best_epoch = 0
+patience_counter = 0
+
+for epoch in range(EPOCHS):
+    model.train()
+    train_loss_total = 0.0
+
+    for xb, yb in train_loader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+
+        optimizer.zero_grad()
+
+        out = model(xb)
+        loss = criterion(out, yb)
+
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=GRAD_CLIP
+        )
+
+        optimizer.step()
+
+        train_loss_total += loss.item() * xb.size(0)
+
+    train_loss = train_loss_total / len(train_loader.dataset)
+
+    model.eval()
+    val_loss_total = 0.0
+    val_predictions = []
+
+    with torch.no_grad():
+        for xb, yb in val_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+
+            out = model(xb)
+            loss = criterion(out, yb)
+
+            val_loss_total += loss.item() * xb.size(0)
+            val_predictions.append(out.detach().cpu().numpy())
+
+    val_loss = val_loss_total / len(val_loader.dataset)
+    val_metrics = validation_score(np.concatenate(val_predictions))
+    if not np.isfinite(val_metrics["score"]):
+        raise FloatingPointError("正式训练验证集综合评分非有限值")
+
+    train_losses.append(train_loss)
+    val_losses.append(val_loss)
+    val_rmses.append(val_metrics["rmse"])
+    val_maes.append(val_metrics["mae"])
+    val_mapes.append(val_metrics["mape"] * 100)
+    val_scores.append(val_metrics["score"])
+
+    scheduler.step(val_metrics["score"])
+    current_lr = optimizer.param_groups[0]["lr"]
+    learning_rates.append(current_lr)
+
+    print(
+        f"Epoch {epoch + 1:03d}/{EPOCHS} | "
+        f"Train Loss={train_loss:.6f} | "
+        f"Val Loss={val_loss:.6f} | "
+        f"Val MAE={val_metrics['mae']:.4f} | "
+        f"Val RMSE={val_metrics['rmse']:.4f} | "
+        f"Val MAPE={val_metrics['mape']*100:.4f}% | "
+        f"Composite={val_metrics['score']:.6f} | "
+        f"LR={current_lr:.8f}"
+    )
+
+    if val_metrics["score"] < best_val_score - 1e-12:
+        best_val_score = val_metrics["score"]
+        best_epoch = epoch + 1
+        patience_counter = 0
+
+        torch.save(model.state_dict(), f"{RES_DIR}/best_model.pth")
+
+    else:
+        patience_counter += 1
+
+        if patience_counter >= PATIENCE:
+            print(f"Early stopping triggered at epoch {epoch + 1}. Best epoch = {best_epoch}")
+            break
+
+
+loss_df = pd.DataFrame({
+    "epoch": np.arange(1, len(train_losses) + 1),
+    "train_loss": train_losses,
+    "val_loss": val_losses,
+    "val_mae": val_maes,
+    "val_rmse": val_rmses,
+    "val_mape_percent": val_mapes,
+    "val_composite": val_scores,
+    "learning_rate": learning_rates
+})
+
+loss_df.to_csv(
+    f"{RES_DIR}/training_log.csv",
+    index=False,
+    encoding="utf-8-sig"
+)
+
+model.load_state_dict(
+    torch.load(
+        f"{RES_DIR}/best_model.pth",
+        map_location=device
+    )
+)
+
+model.to(device)
+model.eval()
+
+print(f"\n已加载验证集最优模型：Epoch {best_epoch}, Best Val Composite={best_val_score:.6f}")
+
+
+def predict_point(model, X_tensor, batch_size=256):
+    model.eval()
+
+    loader = DataLoader(
+        TensorDataset(X_tensor),
+        batch_size=batch_size,
+        shuffle=False
+    )
+
+    preds = []
+
+    with torch.no_grad():
+        for (xb,) in loader:
+            xb = xb.to(device)
+
+            out = model(xb)
+            pred = out.squeeze(-1)
+
+            preds.append(pred.cpu().numpy())
+
+    pred_mean = np.concatenate(preds, axis=0)
+
+    return pred_mean, pred_mean.copy()
+
+
+def inverse_mean(arr):
+    return scaler_y.inverse_transform(arr.reshape(-1, 1))
+
+
+train_pred, train_direct_mean = predict_point(model, torch_X_train)
+val_pred, val_direct_mean = predict_point(model, torch_X_val)
+test_pred, test_direct_mean = predict_point(model, torch_X_test)
+
+train_pred_inv = inverse_mean(train_pred)
+val_pred_inv = inverse_mean(val_pred)
+test_pred_inv = inverse_mean(test_pred)
+
+y_train_inv = scaler_y.inverse_transform(y_train.reshape(-1, 1))
+y_val_inv = scaler_y.inverse_transform(y_val.reshape(-1, 1))
+y_test_inv = scaler_y.inverse_transform(y_test.reshape(-1, 1))
+
+
+val_residual_for_std = (val_pred_inv - y_val_inv).flatten()
+residual_std = float(np.std(val_residual_for_std, ddof=1) + 1e-8)
+
+train_std_inv = np.full_like(train_pred_inv, residual_std)
+val_std_inv = np.full_like(val_pred_inv, residual_std)
+test_std_inv = np.full_like(test_pred_inv, residual_std)
+
+train_lower = train_pred_inv - 1.96 * train_std_inv
+train_upper = train_pred_inv + 1.96 * train_std_inv
+
+val_lower = val_pred_inv - 1.96 * val_std_inv
+val_upper = val_pred_inv + 1.96 * val_std_inv
+
+test_lower = test_pred_inv - 1.96 * test_std_inv
+test_upper = test_pred_inv + 1.96 * test_std_inv
+
+
+def rmse_score(y_true, y_pred):
+    try:
+        return mean_squared_error(y_true, y_pred, squared=False)
+    except TypeError:
+        return np.sqrt(mean_squared_error(y_true, y_pred))
+
+
+def evaluate_dataset(name, y_true, y_pred):
+    return {
+        "Dataset": name,
+        "MAE": mean_absolute_error(y_true, y_pred),
+        "RMSE": rmse_score(y_true, y_pred),
+        "MAPE(%)": mean_absolute_percentage_error(y_true, y_pred) * 100,
+        "R²(%)": r2_score(y_true, y_pred) * 100
+    }
+
+
+metrics = pd.DataFrame([
+    evaluate_dataset("Train", y_train_inv, train_pred_inv),
+    evaluate_dataset("Val", y_val_inv, val_pred_inv),
+    evaluate_dataset("Test", y_test_inv, test_pred_inv)
+])
+
+metrics = metrics[["Dataset", "MAE", "RMSE", "MAPE(%)", "R²(%)"]]
+
+metrics.to_csv(
+    f"{RES_DIR}/evaluation.csv",
+    index=False,
+    encoding="utf-8-sig"
+)
+
+print("\n========== Evaluation Metrics ==========")
+print(metrics)
+
+
+np.save(f"{RES_DIR}/y_train_true.npy", y_train_inv)
+np.save(f"{RES_DIR}/y_val_true.npy", y_val_inv)
+np.save(f"{RES_DIR}/y_test_true.npy", y_test_inv)
+
+np.save(f"{RES_DIR}/y_train_pred.npy", train_pred_inv)
+np.save(f"{RES_DIR}/y_val_pred.npy", val_pred_inv)
+np.save(f"{RES_DIR}/y_test_pred.npy", test_pred_inv)
+
+np.save(f"{RES_DIR}/y_train_std.npy", train_std_inv)
+np.save(f"{RES_DIR}/y_val_std.npy", val_std_inv)
+np.save(f"{RES_DIR}/y_test_std.npy", test_std_inv)
+
+
+def save_pred_csv(name, y_true, y_pred, std, lower, upper):
+    df = pd.DataFrame({
+        "y_true": y_true.flatten(),
+        "y_pred": y_pred.flatten(),
+        "pred_std": std.flatten(),
+        "lower_95": lower.flatten(),
+        "upper_95": upper.flatten(),
+        "residual": (y_pred - y_true).flatten(),
+        "abs_error": np.abs(y_pred - y_true).flatten(),
+        "ape": np.abs((y_pred - y_true) / (y_true + 1e-8)).flatten()
+    })
+
+    df.to_csv(
+        f"{RES_DIR}/{name}_pred_vs_true_with_uncertainty.csv",
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    return df
+
+
+train_pred_df = save_pred_csv(
+    "train",
+    y_train_inv,
+    train_pred_inv,
+    train_std_inv,
+    train_lower,
+    train_upper
+)
+
+val_pred_df = save_pred_csv(
+    "val",
+    y_val_inv,
+    val_pred_inv,
+    val_std_inv,
+    val_lower,
+    val_upper
+)
+
+test_pred_df = save_pred_csv(
+    "test",
+    y_test_inv,
+    test_pred_inv,
+    test_std_inv,
+    test_lower,
+    test_upper
+)
+
+test_pred_df[["y_true", "y_pred"]].rename(
+    columns={
+        "y_true": "y_test_true",
+        "y_pred": "y_test_pred"
+    }
+).to_csv(
+    f"{RES_DIR}/test_pred_vs_true.csv",
+    index=False,
+    encoding="utf-8-sig"
+)
+
+
+def savefig(path):
+    plt.tight_layout()
+    plt.savefig(path, dpi=600, bbox_inches="tight")
+    plt.close()
+
+
+plt.figure(figsize=(10, 4))
+plt.plot(train_losses, label="Train Loss")
+plt.plot(val_losses, label="Val Loss")
+plt.axvline(best_epoch - 1, linestyle="--", label=f"Best Epoch={best_epoch}")
+plt.title("MFPOA-iPerformer Loss Curve")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.legend()
+savefig(f"{FIG_DIR}/loss_curve.png")
+
+
+plt.figure(figsize=(10, 4))
+plt.plot(learning_rates, label="Learning Rate")
+plt.title("Learning Rate Schedule")
+plt.xlabel("Epoch")
+plt.ylabel("Learning Rate")
+plt.legend()
+savefig(f"{FIG_DIR}/learning_rate_curve.png")
+
+
+metric_names = ["MAE", "RMSE", "MAPE(%)", "R²(%)"]
+x = np.arange(len(metrics["Dataset"]))
+width = 0.18
+
+plt.figure(figsize=(11, 5))
+
+for i, m in enumerate(metric_names):
+    values = metrics[m].values.astype(float)
+    denom = max(np.nanmax(np.abs(values)), 1e-8)
+    values_norm = values / denom
+
+    plt.bar(
+        x + (i - 1.5) * width,
+        values_norm,
+        width,
+        label=f"{m} (normalized)"
+    )
+
+plt.xticks(x, metrics["Dataset"])
+plt.title("Normalized Evaluation Metrics")
+plt.ylabel("Normalized Value")
+plt.legend()
+savefig(f"{FIG_DIR}/metrics_bar.png")
+
+
+plt.figure(figsize=(12, 4))
+plt.plot(y_test_inv.flatten(), label="True")
+plt.plot(test_pred_inv.flatten(), label="Predicted")
+plt.title("Test Set: True vs Predicted")
+plt.xlabel("Sample Index")
+plt.ylabel("Target Value")
+plt.legend()
+savefig(f"{FIG_DIR}/test_true_vs_pred_full.png")
+
+
+zoom_n = min(300, len(y_test_inv))
+
+plt.figure(figsize=(12, 4))
+plt.plot(y_test_inv.flatten()[:zoom_n], label="True")
+plt.plot(test_pred_inv.flatten()[:zoom_n], label="Predicted")
+plt.title(f"Test Set: True vs Predicted Zoom First {zoom_n} Samples")
+plt.xlabel("Sample Index")
+plt.ylabel("Target Value")
+plt.legend()
+savefig(f"{FIG_DIR}/test_true_vs_pred_zoom.png")
+
+
+plt.figure(figsize=(12, 5))
+idx = np.arange(zoom_n)
+plt.plot(idx, y_test_inv.flatten()[:zoom_n], label="True")
+plt.plot(idx, test_pred_inv.flatten()[:zoom_n], label="Predicted")
+plt.fill_between(
+    idx,
+    test_lower.flatten()[:zoom_n],
+    test_upper.flatten()[:zoom_n],
+    alpha=0.25,
+    label="95% Prediction Interval"
+)
+plt.title(f"Test Set Prediction Interval First {zoom_n} Samples")
+plt.xlabel("Sample Index")
+plt.ylabel("Target Value")
+plt.legend()
+savefig(f"{FIG_DIR}/test_prediction_interval.png")
+
+
+test_residual = (test_pred_inv - y_test_inv).flatten()
+
+plt.figure(figsize=(12, 4))
+plt.plot(test_residual, label="Residual")
+plt.axhline(0, linestyle="--")
+plt.title("Test Residual Curve")
+plt.xlabel("Sample Index")
+plt.ylabel("Residual")
+plt.legend()
+savefig(f"{FIG_DIR}/test_residual_curve.png")
+
+
+plt.figure(figsize=(8, 5))
+plt.hist(test_residual, bins=40, alpha=0.8)
+plt.axvline(0, linestyle="--")
+plt.title("Test Residual Distribution")
+plt.xlabel("Residual")
+plt.ylabel("Frequency")
+savefig(f"{FIG_DIR}/test_residual_distribution.png")
+
+
+plt.figure(figsize=(6, 6))
+plt.scatter(y_test_inv.flatten(), test_pred_inv.flatten(), s=10, alpha=0.5)
+min_v = min(y_test_inv.min(), test_pred_inv.min())
+max_v = max(y_test_inv.max(), test_pred_inv.max())
+plt.plot([min_v, max_v], [min_v, max_v], linestyle="--")
+plt.title("Test True-Predicted Scatter")
+plt.xlabel("True")
+plt.ylabel("Predicted")
+savefig(f"{FIG_DIR}/test_true_pred_scatter.png")
+
+
+plt.figure(figsize=(8, 5))
+plt.scatter(test_pred_inv.flatten(), test_residual, s=10, alpha=0.5)
+plt.axhline(0, linestyle="--")
+plt.title("Residual vs Predicted")
+plt.xlabel("Predicted")
+plt.ylabel("Residual")
+savefig(f"{FIG_DIR}/test_residual_vs_predicted.png")
+
+
+plt.figure(figsize=(12, 4))
+plt.plot(np.abs(test_residual), label="Absolute Error")
+plt.title("Test Absolute Error Curve")
+plt.xlabel("Sample Index")
+plt.ylabel("Absolute Error")
+plt.legend()
+savefig(f"{FIG_DIR}/test_absolute_error_curve.png")
+
+
+def predict_mean_only(model, X_tensor, batch_size=256):
+    model.eval()
+
+    loader = DataLoader(
+        TensorDataset(X_tensor),
+        batch_size=batch_size,
+        shuffle=False
+    )
+
+    preds = []
+
+    with torch.no_grad():
+        for (xb,) in loader:
+            xb = xb.to(device)
+
+            out = model(xb)
+            pred = out.squeeze(-1)
+
+            preds.append(pred.cpu().numpy())
+
+    preds = np.concatenate(preds, axis=0)
+
+    return scaler_y.inverse_transform(preds.reshape(-1, 1))
+
+
+def permutation_importance_time_series(
+    model,
+    X_np,
+    y_true_inv,
+    feature_names,
+    n_repeats=3
+):
+    baseline_pred = predict_mean_only(
+        model,
+        torch.tensor(X_np, dtype=torch.float32)
+    )
+
+    baseline_rmse = rmse_score(y_true_inv, baseline_pred)
+    baseline_mae = mean_absolute_error(y_true_inv, baseline_pred)
+
+    results = []
+    rng = np.random.default_rng(SEED)
+
+    for j, fname in enumerate(feature_names):
+        rmse_list = []
+        mae_list = []
+
+        for _ in range(n_repeats):
+            X_perm = X_np.copy()
+
+            perm_idx = rng.permutation(X_perm.shape[0])
+            X_perm[:, :, j] = X_perm[perm_idx, :, j]
+
+            pred_perm = predict_mean_only(
+                model,
+                torch.tensor(X_perm, dtype=torch.float32)
+            )
+
+            rmse_perm = rmse_score(y_true_inv, pred_perm)
+            mae_perm = mean_absolute_error(y_true_inv, pred_perm)
+
+            rmse_list.append(rmse_perm)
+            mae_list.append(mae_perm)
+
+        results.append({
+            "Feature": fname,
+            "Baseline_RMSE": baseline_rmse,
+            "Permuted_RMSE": np.mean(rmse_list),
+            "RMSE_Increase": np.mean(rmse_list) - baseline_rmse,
+            "Baseline_MAE": baseline_mae,
+            "Permuted_MAE": np.mean(mae_list),
+            "MAE_Increase": np.mean(mae_list) - baseline_mae
+        })
+
+        print(
+            f"Permutation Importance | {fname}: "
+            f"RMSE Increase = {results[-1]['RMSE_Increase']:.6f}"
+        )
+
+    imp_df = pd.DataFrame(results).sort_values(
+        "RMSE_Increase",
+        ascending=False
+    )
+
+    return imp_df
+
+
+perm_df = permutation_importance_time_series(
+    model=model,
+    X_np=X_test,
+    y_true_inv=y_test_inv,
+    feature_names=feature_names,
+    n_repeats=3
+)
+
+perm_df.to_csv(
+    f"{RES_DIR}/permutation_importance.csv",
+    index=False,
+    encoding="utf-8-sig"
+)
+
+top_k = min(20, len(perm_df))
+
+plt.figure(figsize=(10, max(5, top_k * 0.35)))
+plt.barh(
+    perm_df["Feature"].head(top_k)[::-1],
+    perm_df["RMSE_Increase"].head(top_k)[::-1]
+)
+plt.title("Permutation Importance Based on RMSE Increase")
+plt.xlabel("RMSE Increase")
+plt.ylabel("Feature")
+savefig(f"{FIG_DIR}/permutation_importance_top_features.png")
+
+
+def gradient_saliency(model, X_tensor, max_samples=512):
+    model.eval()
+
+    n = min(max_samples, X_tensor.shape[0])
+
+    x = X_tensor[:n].clone().detach().to(device)
+    x.requires_grad = True
+
+    out = model(x)
+    mean_pred = out.squeeze(-1)
+
+    score = mean_pred.mean()
+
+    model.zero_grad()
+    score.backward()
+
+    saliency = x.grad.detach().abs().cpu().numpy()
+    saliency_mean = saliency.mean(axis=0)
+
+    return saliency_mean
+
+
+saliency_map = gradient_saliency(
+    model,
+    torch_X_test,
+    max_samples=512
+)
+
+saliency_df = pd.DataFrame(
+    saliency_map,
+    columns=feature_names
+)
+
+saliency_df.insert(
+    0,
+    "Time_Step",
+    np.arange(saliency_map.shape[0])
+)
+
+saliency_df.to_csv(
+    f"{RES_DIR}/gradient_saliency_time_feature.csv",
+    index=False,
+    encoding="utf-8-sig"
+)
+
+plt.figure(figsize=(max(10, INPUT_DIM * 0.45), 6))
+plt.imshow(saliency_map, aspect="auto")
+plt.colorbar(label="Mean Absolute Gradient")
+plt.xticks(np.arange(INPUT_DIM), feature_names, rotation=90)
+plt.yticks(np.arange(SEQ_LEN), [f"t-{SEQ_LEN - i}" for i in range(SEQ_LEN)])
+plt.title("Gradient Saliency Heatmap")
+plt.xlabel("Feature")
+plt.ylabel("Time Step")
+savefig(f"{FIG_DIR}/gradient_saliency_heatmap.png")
+
+
+feature_saliency = saliency_map.mean(axis=0)
+
+feature_saliency_df = pd.DataFrame({
+    "Feature": feature_names,
+    "Mean_Gradient_Saliency": feature_saliency
+}).sort_values(
+    "Mean_Gradient_Saliency",
+    ascending=False
+)
+
+feature_saliency_df.to_csv(
+    f"{RES_DIR}/feature_gradient_saliency.csv",
+    index=False,
+    encoding="utf-8-sig"
+)
+
+top_k = min(20, len(feature_saliency_df))
+
+plt.figure(figsize=(10, max(5, top_k * 0.35)))
+plt.barh(
+    feature_saliency_df["Feature"].head(top_k)[::-1],
+    feature_saliency_df["Mean_Gradient_Saliency"].head(top_k)[::-1]
+)
+plt.title("Top Feature Gradient Saliency")
+plt.xlabel("Mean Absolute Gradient")
+plt.ylabel("Feature")
+savefig(f"{FIG_DIR}/feature_gradient_saliency_top.png")
+
+
+time_saliency = saliency_map.mean(axis=1)
+time_labels = [f"t-{SEQ_LEN - i}" for i in range(SEQ_LEN)]
+
+time_saliency_df = pd.DataFrame({
+    "Time_Index": np.arange(SEQ_LEN),
+    "Time_Label": time_labels,
+    "Mean_Gradient_Saliency": time_saliency
+})
+
+time_saliency_df.to_csv(
+    f"{RES_DIR}/time_gradient_saliency.csv",
+    index=False,
+    encoding="utf-8-sig"
+)
+
+plt.figure(figsize=(10, 4))
+plt.plot(time_labels, time_saliency, marker="o")
+plt.title("Time Step Gradient Saliency")
+plt.xlabel("Time Step")
+plt.ylabel("Mean Absolute Gradient")
+plt.xticks(rotation=45)
+savefig(f"{FIG_DIR}/time_gradient_saliency.png")
+
+
+flat_train = X_train.reshape(-1, INPUT_DIM)
+
+corr = np.corrcoef(flat_train.T)
+
+corr_df = pd.DataFrame(
+    corr,
+    index=feature_names,
+    columns=feature_names
+)
+
+corr_df.to_csv(
+    f"{RES_DIR}/input_feature_correlation.csv",
+    encoding="utf-8-sig"
+)
+
+plt.figure(figsize=(max(8, INPUT_DIM * 0.5), max(6, INPUT_DIM * 0.45)))
+plt.imshow(corr, aspect="auto", vmin=-1, vmax=1)
+plt.colorbar(label="Correlation")
+plt.xticks(np.arange(INPUT_DIM), feature_names, rotation=90)
+plt.yticks(np.arange(INPUT_DIM), feature_names)
+plt.title("Input Feature Correlation Heatmap")
+savefig(f"{FIG_DIR}/input_feature_correlation_heatmap.png")
+
+
+def collect_local_global_branch_rms(X_tensor, batch_size=256):
+
+    model.eval()
+    square_sums = np.zeros((NUM_LAYERS, 2), dtype=np.float64)
+    element_count = 0
+    loader = DataLoader(TensorDataset(X_tensor), batch_size=batch_size, shuffle=False)
+    with torch.no_grad():
+        for (xb,) in loader:
+            hidden = model.input_embedding(xb.to(device))
+            if model.time_pos_embed is not None:
+                hidden = hidden + model.time_pos_embed[:, :hidden.size(1), :]
+            element_count += hidden.numel()
+            for layer_idx, layer in enumerate(model.layers):
+                global_update, local_update = layer.branch_updates(hidden)
+                square_sums[layer_idx, 0] += global_update.square().sum().item()
+                square_sums[layer_idx, 1] += local_update.square().sum().item()
+                hidden = hidden + global_update + local_update
+                hidden = hidden + layer.ffn(layer.norm2(hidden))
+
+    rms = np.sqrt(square_sums / element_count)
+    return pd.DataFrame({
+        "Layer": np.arange(1, NUM_LAYERS + 1),
+        "Global_RMS": rms[:, 0],
+        "Local_RMS": rms[:, 1],
+        "Local_to_Global_RMS": rms[:, 1] / np.maximum(rms[:, 0], 1e-12),
+    })
+
+
+for split, inputs in (("train", torch_X_train), ("val", torch_X_val),
+                      ("test", torch_X_test)):
+    branch_df = collect_local_global_branch_rms(inputs)
+    branch_df.to_csv(f"{RES_DIR}/{split}_local_global_branch_rms.csv",
+                     index=False, encoding="utf-8-sig")
+    if split == "test":
+        test_branch_df = branch_df
+
+plt.figure(figsize=(8, 4))
+layer_positions = np.arange(NUM_LAYERS)
+plt.bar(layer_positions - 0.18, test_branch_df["Global_RMS"], width=0.36,
+        label="Global Performer")
+plt.bar(layer_positions + 0.18, test_branch_df["Local_RMS"], width=0.36,
+        label="Local convolution")
+plt.xticks(layer_positions, test_branch_df["Layer"])
+plt.xlabel("Encoder layer")
+plt.ylabel("Branch output RMS")
+plt.title("MFPOA-iPerformer Local and Global Branch Magnitudes (Test)")
+plt.legend()
+savefig(f"{FIG_DIR}/test_local_global_branch_rms.png")
+
+
+summary_lines = [
+    "MFPOA-iPerformer parallel local-global encoder experiment completed.",
+    f"Best epoch: {best_epoch}",
+    f"Best validation composite: {best_val_score:.6f}",
+    f"Input shape: X=[N,{SEQ_LEN},{INPUT_DIM}]",
+    f"d_model: {D_MODEL}",
+    f"num_layers: {NUM_LAYERS}",
+    f"n_heads: {N_HEADS}",
+    f"nb_features: {NB_FEATURES}",
+    f"Use time positional embedding: {USE_TIME_POS_EMBED}",
+    f"Redraw projection: {REDRAW_PROJECTION}",
+    f"Total params: {total_params}",
+    f"Trainable params: {trainable_params}",
+    "",
+    "Model structure:",
+    "1. Linear input embedding from feature dimension to d_model.",
+    "2. Learnable time positional embedding.",
+    "3. Parallel local depthwise convolution and Performer FAVOR+ attention in every encoder layer.",
+    "4. Zero-initialized local pointwise projection and shared residual fusion.",
+    "5. Mean pooling over temporal tokens.",
+    "6. Linear regression head.",
+    "",
+    "Ablation purpose:",
+    "Temporal global attention remains Performer; local time dependencies are modeled by convolution.",
+    "Branch output RMS is descriptive and is not causal attribution.",
+    "",
+    "Generated result files:",
+    "1. evaluation.csv",
+    "2. training_log.csv",
+    "3. experiment_config.csv",
+    "4. test_pred_vs_true.csv",
+    "5. train/val/test_pred_vs_true_with_uncertainty.csv",
+    "6. permutation_importance.csv",
+    "7. gradient_saliency_time_feature.csv",
+    "8. input_feature_correlation.csv",
+    "9. train/val/test_local_global_branch_rms.csv",
+    "10. mfpoa_search_trials.csv / mfpoa_convergence.csv / mfpoa_phase_history.csv",
+    "11. mfpoa_strategy_history.csv / mfpoa_guide_history.csv / mfpoa_coupling_history.csv",
+    "12. mfpoa_diagnostics.csv / mfpoa_warmup_survival.csv",
+    "13. mfpoa_refinement.csv / mfpoa_search_settings.json",
+    "",
+    "Generated figures:",
+    "1. loss_curve.png",
+    "2. learning_rate_curve.png",
+    "3. metrics_bar.png",
+    "4. test_true_vs_pred_full.png",
+    "5. test_true_vs_pred_zoom.png",
+    "6. test_prediction_interval.png",
+    "7. test_residual_curve.png",
+    "8. test_residual_distribution.png",
+    "9. test_true_pred_scatter.png",
+    "10. test_residual_vs_predicted.png",
+    "11. test_absolute_error_curve.png",
+    "12. permutation_importance_top_features.png",
+    "13. gradient_saliency_heatmap.png",
+    "14. feature_gradient_saliency_top.png",
+    "15. time_gradient_saliency.png",
+    "16. input_feature_correlation_heatmap.png",
+    "17. test_local_global_branch_rms.png",
+    "",
+    "All figures are saved with 600 DPI."
+]
+
+with open(f"{RES_DIR}/experiment_summary.txt", "w", encoding="utf-8") as f:
+    f.write("\n".join(summary_lines))
+
+
+print("\nMFPOA-iPerformer 局部—全局并行编码实验完成！")
+print(f"结果保存路径: {RES_DIR}")
+print(f"图片保存路径: {FIG_DIR}")
+
+
+"""From actual MFPOA-iPerformer output, draw vector/600-dpi figures and a report.
+
+The report generator runs automatically after prediction and analysis.
+It reads actual output only; its functions never train a model.
+"""
+
+
+import json
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from joblib import load
+
+
+def _format_metrics(frame):
+    lines = ["| Dataset | MAE | RMSE | MAPE (%) | R² (%) |",
+             "|---|---:|---:|---:|---:|"]
+    for _, row in frame.iterrows():
+        lines.append("| {} | {:.4f} | {:.4f} | {:.3f} | {:.3f} |".format(
+            row["Dataset"], row["MAE"], row["RMSE"],
+            row["MAPE(%)"], row["R²(%)"]))
+    return "\n".join(lines)
+
+
+def _save(fig, destination):
+    fig.savefig(str(destination.with_suffix(".png")), dpi=600,
+                bbox_inches="tight", facecolor="white")
+    fig.savefig(str(destination.with_suffix(".pdf")),
+                bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
+def _set_style():
+    plt.rcParams.update({
+        "font.family": "DejaVu Sans", "font.size": 10,
+        "axes.spines.top": False, "axes.spines.right": False,
+        "axes.labelsize": 11, "axes.titlesize": 12,
+        "figure.dpi": 120, "savefig.transparent": False,
+    })
+
+
+def _scores(y, pred):
+    delta = np.asarray(pred) - np.asarray(y)
+    return {"MAE": float(np.mean(np.abs(delta))),
+            "RMSE": float(np.sqrt(np.mean(delta * delta)))}
+
+
+def _baseline_rows(test_true, candidate_paths):
+    rows, notes = [], []
+    for label, path in candidate_paths:
+        pred_file = path / "test_pred_vs_true.csv"
+        if not pred_file.is_file():
+            notes.append(f"{label}: 未找到独立保存的预测 CSV，未作比较。")
+            continue
+        table = pd.read_csv(pred_file)
+        if not {"y_test_true", "y_test_pred"}.issubset(table.columns):
+            notes.append(f"{label}: CSV 列不匹配，未作比较。")
+            continue
+        y_base = table["y_test_true"].to_numpy(dtype=float)
+        if (len(y_base) != len(test_true) or
+                not np.allclose(y_base, test_true, atol=1e-4, rtol=1e-7)):
+            notes.append(f"{label}: 测试标签不一致，禁止跨数据划分比较。")
+            continue
+        rows.append({"Model": label, **_scores(
+            test_true, table["y_test_pred"].to_numpy(dtype=float))})
+    return rows, notes
+
+
+def generate_report(out_dir="train_results/MFPOA-iPerformer"):
+    out_dir = Path(out_dir)
+    results = out_dir / "results"
+    figures = out_dir / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    needed = ["mfpoa_search_settings.json", "mfpoa_search_trials.csv",
+              "mfpoa_convergence.csv", "evaluation.csv", "training_log.csv",
+              "test_pred_vs_true.csv", "test_local_global_branch_rms.csv"]
+    missing = [name for name in needed if not (results / name).is_file()]
+    if missing:
+        raise FileNotFoundError("实验未完成或缺少输出：" + ", ".join(missing))
+
+    _set_style()
+    settings = json.loads((results / "mfpoa_search_settings.json").read_text(encoding="utf-8"))
+    trials = pd.read_csv(results / "mfpoa_search_trials.csv")
+    convergence = pd.read_csv(results / "mfpoa_convergence.csv")
+    metrics = pd.read_csv(results / "evaluation.csv")
+    training = pd.read_csv(results / "training_log.csv")
+    test = pd.read_csv(results / "test_pred_vs_true.csv")
+    branches = pd.read_csv(results / "test_local_global_branch_rms.csv")
+
+    y_true = test["y_test_true"].to_numpy(dtype=float)
+    y_pred = test["y_test_pred"].to_numpy(dtype=float)
+    error = y_pred - y_true
+    if len(y_true) == 0 or not np.isfinite(y_true).all() or not np.isfinite(y_pred).all():
+        raise ValueError("测试预测为空或包含非有限值，不能生成报告")
+
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.2), layout="constrained")
+    ax1.step(convergence["FE"], convergence["best_val_composite"],
+             where="post", lw=2, color="#145C83")
+    ax1.set(title="(a) MFPOA convergence", xlabel="Fitness evaluation (FE)",
+            ylabel="Best validation composite")
+    ax1.grid(alpha=0.18)
+    ax2.scatter(trials["FE"], trials["fitness_composite"],
+                s=19, alpha=0.55, c="#B65F33", label="All candidates")
+    best_so_far = np.minimum.accumulate(trials["fitness_composite"])
+    ax2.plot(trials["FE"], best_so_far, c="#145C83", lw=1.8,
+             label="Best so far")
+    ax2.set(title="(b) Candidate quality", xlabel="Fitness evaluation (FE)",
+            ylabel="Validation composite")
+    ax2.legend(frameon=False)
+    ax2.grid(alpha=0.18)
+    _save(fig, figures / "paper_mfpoa_optimization")
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8), layout="constrained")
+    x = np.arange(len(y_true))
+    axes[0, 0].plot(x, y_true, c="#193B59", lw=1.3, label="Observed")
+    axes[0, 0].plot(x, y_pred, c="#D87A38", lw=1.1, label="Predicted")
+    axes[0, 0].set(title="(a) Full test period", xlabel="Test sample",
+                   ylabel="Close (index points)")
+    axes[0, 0].legend(frameon=False)
+    zoom = min(80, len(y_true))
+    axes[0, 1].plot(x[-zoom:], y_true[-zoom:], c="#193B59", lw=1.3, label="Observed")
+    axes[0, 1].plot(x[-zoom:], y_pred[-zoom:], c="#D87A38", lw=1.2, label="Predicted")
+    axes[0, 1].set(title=f"(b) Last {zoom} test samples", xlabel="Test sample",
+                   ylabel="Close (index points)")
+    axes[1, 0].scatter(y_true, y_pred, s=13, alpha=0.60, color="#145C83")
+    lo, hi = min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())
+    axes[1, 0].plot([lo, hi], [lo, hi], ls="--", color="#9B4E46", lw=1)
+    axes[1, 0].set(title="(c) Prediction agreement", xlabel="Observed Close",
+                   ylabel="Predicted Close")
+    axes[1, 1].plot(x, error, color="#446E8E", lw=1)
+    axes[1, 1].axhline(0, color="#9B4E46", ls="--", lw=1)
+    axes[1, 1].set(title="(d) Test residuals", xlabel="Test sample",
+                   ylabel="Prediction − observation")
+    for ax in axes.ravel():
+        ax.grid(alpha=0.15)
+    _save(fig, figures / "paper_prediction_diagnostics")
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.2), layout="constrained")
+    ax1.plot(training["epoch"], training["train_loss"], label="Training", color="#145C83")
+    ax1.plot(training["epoch"], training["val_loss"], label="Validation", color="#D87A38")
+    ax1.set(title="(a) Training dynamics", xlabel="Epoch", ylabel="SmoothL1 loss")
+    ax1.legend(frameon=False)
+    layer_x = np.arange(len(branches))
+    ax2.bar(layer_x - .18, branches["Global_RMS"], .36,
+            color="#145C83", label="Global attention")
+    ax2.bar(layer_x + .18, branches["Local_RMS"], .36,
+            color="#D87A38", label="Local convolution")
+    ax2.set_xticks(layer_x, branches["Layer"])
+    ax2.set(title="(b) Encoder branch magnitudes", xlabel="Encoder layer",
+            ylabel="Test output RMS")
+    ax2.legend(frameon=False)
+    for ax in (ax1, ax2):
+        ax.grid(axis="y", alpha=0.15)
+    _save(fig, figures / "paper_training_and_branches")
+
+    naive_note, naive_row = "", None
+    metadata_file = Path("npy_data/sample_index_test.csv")
+    if metadata_file.is_file():
+        metadata = pd.read_csv(metadata_file)
+        if ("naive_pred_close" in metadata and "target_close" in metadata and
+                len(metadata) == len(y_true) and
+                np.allclose(metadata["target_close"], y_true, atol=1e-4, rtol=1e-7)):
+            naive_row = {"Model": "Last observed Close (persistence)",
+                         **_scores(y_true, metadata["naive_pred_close"].to_numpy(dtype=float))}
+        else:
+            naive_note = "预处理元数据未通过标签对齐验证，因此未加入持续性基线。"
+
+    comparison = [{"Model": "MFPOA-iPerformer", **_scores(y_true, y_pred)}]
+    if naive_row:
+        comparison.append(naive_row)
+    extra, notes = _baseline_rows(y_true, [
+        ("Performer", Path("train_results/Performer/results")),
+        ("iPerformer (independent run)", Path("train_results/iPerformer/results")),
+    ])
+    comparison.extend(extra)
+    if naive_note:
+        notes.append(naive_note)
+    pd.DataFrame(comparison).to_csv(results / "report_baseline_comparison.csv",
+                                    index=False, encoding="utf-8-sig")
+    if len(comparison) > 1:
+        fig, ax = plt.subplots(figsize=(8, 4.4), layout="constrained")
+        labels = [row["Model"] for row in comparison]
+        y = np.arange(len(labels))
+        ax.barh(y - .19, [row["MAE"] for row in comparison], height=.36,
+                color="#145C83", label="MAE")
+        ax.barh(y + .19, [row["RMSE"] for row in comparison], height=.36,
+                color="#D87A38", label="RMSE")
+        ax.set_yticks(y, labels)
+        ax.invert_yaxis()
+        ax.set(xlabel="Error (index points)", title="Aligned test-set comparison")
+        ax.legend(frameon=False)
+        ax.grid(axis="x", alpha=.15)
+        _save(fig, figures / "paper_aligned_baseline_comparison")
+
+    selected = settings["selected_config"]
+    configuration = "\n".join(f"| {key} | {value} |" for key, value in selected.items())
+    comparison_table = "\n".join([
+        "| Model | Test MAE | Test RMSE |", "|---|---:|---:|",
+        *(f'| {r["Model"]} | {r["MAE"]:.4f} | {r["RMSE"]:.4f} |'
+          for r in comparison),
+    ])
+    note_lines = "\n".join("- " + note for note in notes) if notes else "- 对照标签已完成逐项对齐检查。"
+    report = f"""
+
